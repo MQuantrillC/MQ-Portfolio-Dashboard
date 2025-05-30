@@ -1199,6 +1199,7 @@ if create_portfolio and selected_tickers:
     # Convert years to date strings for yfinance
     start_date = f"{st.session_state['start_year']}-01-01"
     end_date = f"{st.session_state['end_year']}-12-31"
+    
     if risk_level == "Custom":
         # Use custom weights from session state
         custom_weights = {t: st.session_state['custom_weight_inputs'].get(t, 0.0) for t in selected_tickers}
@@ -1213,16 +1214,84 @@ if create_portfolio and selected_tickers:
         # Download price data with improved error handling
         with st.spinner("Downloading price data for optimization..."):
             try:
-                data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
-                st.session_state['debug_data'] = data  # Store for inspection
+                # Try downloading each ticker individually first
+                valid_tickers = []
+                failed_tickers = []
                 
-                if data.empty:
-                    st.error("No data returned from yfinance download")
+                for ticker in selected_tickers:
+                    try:
+                        # Test download for each ticker
+                        test_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                        if test_data.empty:
+                            st.warning(f"No data returned for {ticker}")
+                            failed_tickers.append(ticker)
+                        else:
+                            valid_tickers.append(ticker)
+                    except Exception as e:
+                        st.warning(f"Failed to download {ticker}: {str(e)}")
+                        failed_tickers.append(ticker)
+                
+                if not valid_tickers:
+                    st.error("No valid tickers with data available")
                     st.stop()
                 
-                # Debug output to show what data was received
-                if st.session_state.get('debug_mode', False):
-                    st.write("Raw downloaded data:", data)
+                # Now download all valid tickers together
+                data = yf.download(valid_tickers, start=start_date, end=end_date, interval="1d", threads=True)
+                
+                if data.empty:
+                    st.error(f"No data returned for valid tickers: {valid_tickers}")
+                    if failed_tickers:
+                        st.error(f"Failed tickers: {', '.join(failed_tickers)}")
+                    st.stop()
+                
+                # Store debug data
+                st.session_state['debug_data'] = data
+                
+                # Calculate returns and covariance
+                try:
+                    close_prices = data['Adj Close']
+                    returns = close_prices.pct_change().dropna()
+                    mean_returns = returns.mean()
+                    cov_matrix = returns.cov()
+                    
+                    if mean_returns.empty or cov_matrix.empty:
+                        st.error("Optimization failed due to insufficient data:")
+                        if mean_returns.empty:
+                            st.error("- No return data calculated")
+                        if cov_matrix.empty:
+                            st.error("- No covariance matrix calculated")
+                        
+                        # Show which tickers have data
+                        available_data = []
+                        for t in valid_tickers:
+                            try:
+                                if t in close_prices.columns:
+                                    available_data.append(f"{t}: {len(close_prices[t].dropna())} data points")
+                                else:
+                                    available_data.append(f"{t}: No data")
+                            except:
+                                available_data.append(f"{t}: Error checking")
+                        
+                        st.error("Data availability: " + ", ".join(available_data))
+                        st.stop()
+                    
+                    # Continue with optimization using valid_tickers instead of selected_tickers
+                    weights = get_optimized_weights(mean_returns, cov_matrix, risk_level)
+                    
+                    # Create portfolio DataFrame with only valid tickers
+                    portfolio = pd.DataFrame({
+                        'Ticker': valid_tickers,
+                        'Weight': weights
+                    })
+                    
+                    # Display results
+                    st.write("### Optimized Portfolio")
+                    st.write(portfolio)
+                    
+                except Exception as e:
+                    st.error(f"Error calculating returns and covariance: {str(e)}")
+                    st.error(traceback.format_exc())
+                    st.stop()
                 
             except Exception as e:
                 st.error(f"Error downloading data: {str(e)}")
