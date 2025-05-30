@@ -5,7 +5,6 @@ import yfinance as yf
 import plotly.graph_objs as go
 from datetime import datetime
 import requests
-import kagglehub
 import os
 import plotly.express as px
 from collections import Counter
@@ -422,16 +421,32 @@ def get_finnhub_sector_performance():
 @st.cache_data(ttl=86400)  # 24 hours for S&P 500 tickers
 def get_sp500_tickers():
     """
-    Fetch S&P 500 tickers:
+    Fetch S&P 500 tickers with sector info:
     1. Try yFinance from ^GSPC components.
     2. Fallback to maintained GitHub CSV.
+    Returns DataFrame with Symbol, Name, Sector, Industry columns
     """
     # Try yFinance first
     try:
         sp500 = yf.Ticker("^GSPC")
         components = sp500.components
         if components is not None and not components.empty:
-            return sorted(components.index.str.replace(".", "-", regex=False).tolist())
+            components.index = components.index.str.replace(".", "-", regex=False)
+            components = components.reset_index()
+            components.columns = ['Symbol', 'Name']
+            # Try to get sector info from yfinance
+            sectors = []
+            for ticker in components['Symbol']:
+                try:
+                    info = yf.Ticker(ticker).info
+                    sectors.append({
+                        'Sector': info.get('sector', 'Unknown'),
+                        'Industry': info.get('industry', 'Unknown')
+                    })
+                except:
+                    sectors.append({'Sector': 'Unknown', 'Industry': 'Unknown'})
+            sectors_df = pd.DataFrame(sectors)
+            return pd.concat([components, sectors_df], axis=1)
     except Exception:
         pass  # Fail silently and try fallback
     
@@ -439,10 +454,24 @@ def get_sp500_tickers():
     try:
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df = pd.read_csv(url)
-        return sorted(df["Symbol"].str.replace(".", "-", regex=False).tolist())
-    except Exception:
-        st.warning("Could not fetch S&P 500 tickers from any source. Using fallback list.")
-        return ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "PG"]  # Last resort
+        df['Symbol'] = df['Symbol'].str.replace(".", "-", regex=False)
+        # Rename columns to match yfinance format
+        df = df.rename(columns={
+            'Security': 'Name',
+            'GICS Sector': 'Sector',
+            'GICS Sub-Industry': 'Industry'
+        })
+        return df[['Symbol', 'Name', 'Sector', 'Industry']]
+    except Exception as e:
+        st.warning(f"Could not fetch S&P 500 tickers: {str(e)}. Using fallback list.")
+        fallback = pd.DataFrame({
+            'Symbol': ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "PG"],
+            'Name': ["Apple", "Microsoft", "Alphabet", "Amazon", "Tesla", "Nvidia", "Meta", "JPMorgan", "Visa", "Procter & Gamble"],
+            'Sector': ["Technology"]*6 + ["Communication Services", "Financial Services", "Financial Services", "Consumer Defensive"],
+            'Industry': ["Consumer Electronics", "Software", "Internet Content", "E-Commerce", "Auto Manufacturers", "Semiconductors", 
+                        "Internet Content", "Banks", "Credit Services", "Household Products"]
+        })
+        return fallback
 
 @st.cache_data(ttl=3600)  # 1 hour for market data
 def get_top_movers(timeframe="1d"):
@@ -451,12 +480,11 @@ def get_top_movers(timeframe="1d"):
         # Get S&P 500 tickers
         try:
             sp500_tickers = get_sp500_tickers()
-            if not sp500_tickers:
-                st.warning("Could not fetch S&P 500 tickers")
-                return [], []
+            if not sp500_tickers.empty:
+                return sp500_tickers
         except Exception as e:
             st.warning(f"Error getting S&P 500 tickers: {str(e)}")
-            return [], []
+            return pd.DataFrame()
         
         # Limit to top 100 tickers for better performance
         sp500_tickers = sp500_tickers[:100]
@@ -481,7 +509,7 @@ def get_top_movers(timeframe="1d"):
         try:
             # Download data with MultiIndex structure and threading enabled
             data = yf.download(
-                sp500_tickers, 
+                sp500_tickers['Symbol'], 
                 period=period, 
                 interval=interval, 
                 group_by="ticker", 
@@ -492,7 +520,7 @@ def get_top_movers(timeframe="1d"):
             returns = {}
             failed_tickers = []
             
-            for ticker in sp500_tickers:
+            for ticker in sp500_tickers['Symbol']:
                 try:
                     # Handle both MultiIndex and flat index structures
                     if isinstance(data.columns, pd.MultiIndex):
@@ -522,14 +550,14 @@ def get_top_movers(timeframe="1d"):
                 
             if not returns:
                 st.warning("No valid return data found for selected timeframe.")
-                return [], []
+                return pd.DataFrame()
                 
             sorted_returns = sorted(returns.items(), key=lambda x: x[1], reverse=True)
-            return sorted_returns[:10], sorted_returns[-10:][::-1]
+            return sp500_tickers.iloc[sorted_returns[:10].index]
             
         except Exception as e:
             st.error(f"Error downloading market data: {str(e)}")
-            return [], []
+            return pd.DataFrame()
 
 @st.cache_data(ttl=3600)  # 1 hour for sector performance
 def get_sector_performance_custom(timeframe="1mo"):
@@ -886,13 +914,6 @@ if 'custom_tooltip_css' not in st.session_state:
 # Sidebar
 # st.sidebar.title("Portfolio Options")
 
-# Load Kaggle CSV for sector/industry fallback and sector allocation (make available globally)
-try:
-    kaggle_csv_path = os.path.join(kagglehub.dataset_download("andrewmvd/sp-500-stocks"), "sp500_stocks.csv")
-    kaggle_df = pd.read_csv(kaggle_csv_path)
-except Exception:
-    kaggle_df = None
-
 # Global constants
 BLUE_PALETTE = ['#1f77b4', '#2ca9e1', '#4dabf7', '#74c0fc', '#90d8fd', '#a5d8ff', '#c4e0ff', '#d6e9ff']
 
@@ -960,18 +981,35 @@ def get_financial_data(ticker, statement_type):
 # Helper functions at the top
 @st.cache_data(ttl=86400)  # 24 hours for financial data
 def get_sector_allocation_from_yfinance(tickers):
+    """Get sector allocation using yfinance and fallback to GitHub data"""
+    # Get the full S&P 500 data
+    sp500_data = get_sp500_tickers()
+    
     sector_map = {}
     missing_tickers = []
+    
     for ticker in tickers:
+        # First try yfinance
         try:
             info = yf.Ticker(ticker).info
             sector = info.get("sector", None)
             if sector:
                 sector_map[ticker] = sector
-            else:
-                missing_tickers.append(ticker)
+                continue  # Found in yfinance, move to next ticker
         except Exception:
-            missing_tickers.append(ticker)
+            pass
+        
+        # Fallback to GitHub data
+        ticker_row = sp500_data[sp500_data['Symbol'].str.upper() == ticker.upper()]
+        if not ticker_row.empty:
+            sector = ticker_row['Sector'].values[0]
+            if sector != 'Unknown':
+                sector_map[ticker] = sector
+                continue
+        
+        # If we get here, we couldn't find the sector
+        missing_tickers.append(ticker)
+    
     return sector_map, missing_tickers
 
 def to_yahoo_ticker(ticker):
@@ -1945,14 +1983,14 @@ if st.session_state.get('portfolio_created'):
                                 
                                 # Fallback to Kaggle CSV if missing
                                 if kaggle_df is not None:
-                                    row = kaggle_df[kaggle_df['Symbol'].str.upper() == ticker.upper()]
-                                    if not row.empty:
-                                        if sector == 'N/A' and 'Sector' in row:
-                                            sector = row['Sector'].values[0]
-                                        if industry == 'N/A' and 'Industry' in row:
-                                            industry = row['Industry'].values[0]
-                                        if employees == 'N/A' and 'Full Time Employees' in row:
-                                            employees = row['Full Time Employees'].values[0]
+                                    ticker_row = kaggle_df[kaggle_df['Symbol'].str.upper() == ticker.upper()]
+                                    if not ticker_row.empty:
+                                        if sector == 'N/A':
+                                            sector = ticker_row['Sector'].values[0] if 'Sector' in ticker_row else 'N/A'
+                                        if industry == 'N/A':
+                                            industry = ticker_row['Industry'].values[0] if 'Industry' in ticker_row else 'N/A'
+                                        if employees == 'N/A' and 'Full Time Employees' in ticker_row:
+                                            employees = ticker_row['Full Time Employees'].values[0]
                                 
                                 st.markdown(f"""
                                 <div style="margin-top: 20px; font-size: 0.9rem;">
