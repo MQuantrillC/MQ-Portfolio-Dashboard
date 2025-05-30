@@ -40,33 +40,21 @@ def get_historical_closes(ticker):
     """Get historical close prices for different time periods"""
     try:
         # Get current price
-        current_price = yf.Ticker(ticker).history(period="1d")["Close"].iloc[-1]
+        current_price = yf.Ticker(to_yahoo_ticker(ticker)).history(period="1d")["Close"].iloc[-1]
         
         # Get historical prices
-        five_d_ago = yf.Ticker(ticker).history(period="5d")["Close"].iloc[0]
-        one_m_ago = yf.Ticker(ticker).history(period="1mo")["Close"].iloc[0]
-        six_m_ago = yf.Ticker(ticker).history(period="6mo")["Close"].iloc[0]
-        
-        # For YTD, get first trading day of current year
-        today = datetime.now()
-        ytd_start = datetime(today.year, 1, 1).strftime('%Y-%m-%d')
-        ytd_price = yf.Ticker(ticker).history(start=ytd_start)["Close"].iloc[0]
-        
-        one_y_ago = yf.Ticker(ticker).history(period="1y")["Close"].iloc[0]
-        five_y_ago = yf.Ticker(ticker).history(period="5y")["Close"].iloc[0]
+        five_d_ago = yf.Ticker(to_yahoo_ticker(ticker)).history(period="5d")["Close"].iloc[0]
+        one_m_ago = yf.Ticker(to_yahoo_ticker(ticker)).history(period="1mo")["Close"].iloc[0]
+        six_m_ago = yf.Ticker(to_yahoo_ticker(ticker)).history(period="6mo")["Close"].iloc[0]
         
         return {
-            "Current": current_price,
-            "5D Ago": five_d_ago,
-            "1M Ago": one_m_ago,
-            "6M Ago": six_m_ago,
-            "YTD Start": ytd_price,
-            "1Y Ago": one_y_ago,
-            "5Y Ago": five_y_ago
+            'current': current_price,
+            '5d': five_d_ago,
+            '1m': one_m_ago,
+            '6m': six_m_ago
         }
     except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error getting historical prices for {ticker}: {str(e)}")
+        st.error(f"Error fetching historical prices for {ticker}: {str(e)}")
         return None
 
 def get_spy_status_icon_and_label(change_percent: float, timeframe: str) -> Tuple[str, str]:
@@ -176,42 +164,15 @@ def calculate_period_change(close_series, period_label):
 
 @st.cache_data(ttl=3600)
 def calculate_cached_period_change(ticker, period, interval):
-    """Cached version of period change calculation with improved error handling"""
+    """Calculate period change with caching"""
     try:
-        # Get the period label from the period_options mapping
-        period_label = next((k for k, v in period_options.items() if v[0] == period), None)
-        if period_label is None:
-            if st.session_state.get('debug_mode', False):
-                st.error(f"Invalid period: {period}")
-            return None, None
-
-        # For intraday periods, ensure we get enough data
-        if period_label in ["1D", "5D"]:
-            # Add extra buffer for intraday data to ensure we have enough points
-            if period_label == "1D":
-                period = "2d"  # Get 2 days of data to ensure we have enough points
-            else:  # 5D
-                period = "6d"  # Get 6 days of data to ensure we have enough points
-
-        # Download data with progress=False to avoid UI clutter
-        data = yf.download(ticker, period=period, interval=interval, progress=False)
-        
-        if data.empty or 'Close' not in data.columns:
-            if st.session_state.get('debug_mode', False):
-                st.error(f"No data returned for {ticker}")
-            return None, None
-
-        # Get close prices and ensure we have a Series
-        close_series = data['Close'] if isinstance(data['Close'], pd.Series) else data['Close'].iloc[:, 0]
-        
-        # Calculate changes using the improved function
-        return calculate_period_change(close_series, period_label)
-        
+        data = yf.download(to_yahoo_ticker(ticker), period=period, interval=interval)
+        if data.empty:
+            return None
+        return calculate_period_change(data['Close'], period)
     except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error in calculate_cached_period_change: {str(e)}")
-            st.error(traceback.format_exc())
-        return None, None
+        st.error(f"Error calculating period change for {ticker}: {str(e)}")
+        return None
 
 # Set page to wide layout
 st.set_page_config(
@@ -845,29 +806,14 @@ def interpret_ratios(ratios):
 
 @st.cache_data(ttl=3600)  # 1 hour for asset price changes
 def get_asset_price_change(symbol: str, period: str = "1mo"):
-    import yfinance as yf
-    import numpy as np
-
+    """Get price change for an asset"""
     try:
-        data = yf.download(symbol, period=period, progress=False)
-        if data.empty or "Close" not in data.columns:
+        data = yf.download(to_yahoo_ticker(symbol), period=period)
+        if data.empty:
             return None
-
-        close_prices = data["Close"].dropna()
-        if len(close_prices) < 2:
-            return None
-
-        current_price = close_prices.iloc[-1]
-        old_price = close_prices.iloc[0]
-        pct_change = ((current_price - old_price) / old_price) * 100
-
-        return {
-            "symbol": symbol,
-            "current_price": current_price,
-            "pct_change": pct_change
-        }
+        return calculate_period_change(data['Close'], period)
     except Exception as e:
-        print(f"Error loading {symbol}: {e}")
+        st.error(f"Error getting price change for {symbol}: {str(e)}")
         return None
 
 # Monte Carlo Simulation Helper
@@ -984,7 +930,7 @@ def get_financial_data(ticker, statement_type):
     cache_key = f"{ticker}_{statement_type}"
     if cache_key not in st.session_state['financial_data_cache']:
         try:
-            ticker_obj = yf.Ticker(ticker)
+            ticker_obj = yf.Ticker(to_yahoo_ticker(ticker))
             if statement_type == 'income':
                 data = ticker_obj.income_stmt
             elif statement_type == 'balance':
@@ -1033,6 +979,7 @@ def get_sector_allocation_from_yfinance(tickers):
     return sector_map, missing_tickers
 
 def to_yahoo_ticker(ticker):
+    """Convert ticker symbol to Yahoo Finance format"""
     return ticker.replace('.', '-')
 
 def format_market_cap(val):
@@ -1270,7 +1217,8 @@ if create_portfolio and selected_tickers:
             # Download each ticker individually with error handling
             for ticker in selected_tickers:
                 try:
-                    data = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                    yahoo_ticker = to_yahoo_ticker(ticker)
+                    data = yf.download(yahoo_ticker, start=start_date, end=end_date, progress=False)
                     if data.empty or 'Close' not in data.columns:
                         failed_tickers.append(ticker)
                         continue
@@ -2049,7 +1997,7 @@ if st.session_state.get('portfolio_created'):
                                 
                                 if historical_prices:
                                     # Current price
-                                    current_price = historical_prices["Current"]
+                                    current_price = historical_prices["current"]
                                     price_display = f"${current_price:,.2f}" if isinstance(current_price, (int, float)) else 'N/A'
                                     
                                     # Create the price display card
@@ -2067,18 +2015,18 @@ if st.session_state.get('portfolio_created'):
                                     hist_df = pd.DataFrame({
                                         "Period": ["1 Month Ago", "6 Months Ago", "YTD Start", "1 Year Ago", "5 Years Ago"],
                                         "Price": [
-                                            f"${historical_prices['1M Ago']:,.2f}" if historical_prices['1M Ago'] else 'N/A',
-                                            f"${historical_prices['6M Ago']:,.2f}" if historical_prices['6M Ago'] else 'N/A',
-                                            f"${historical_prices['YTD Start']:,.2f}" if historical_prices['YTD Start'] else 'N/A',
-                                            f"${historical_prices['1Y Ago']:,.2f}" if historical_prices['1Y Ago'] else 'N/A',
-                                            f"${historical_prices['5Y Ago']:,.2f}" if historical_prices['5Y Ago'] else 'N/A'
+                                            f"${historical_prices['1m']:,.2f}" if historical_prices['1m'] else 'N/A',
+                                            f"${historical_prices['6m']:,.2f}" if historical_prices['6m'] else 'N/A',
+                                            f"${historical_prices['ytd']:,.2f}" if historical_prices['ytd'] else 'N/A',
+                                            f"${historical_prices['1y']:,.2f}" if historical_prices['1y'] else 'N/A',
+                                            f"${historical_prices['5y']:,.2f}" if historical_prices['5y'] else 'N/A'
                                         ],
                                         "% Change": [
-                                            f"{((current_price - historical_prices['1M Ago']) / historical_prices['1M Ago'] * 100):+.2f}%" if historical_prices['1M Ago'] else 'N/A',
-                                            f"{((current_price - historical_prices['6M Ago']) / historical_prices['6M Ago'] * 100):+.2f}%" if historical_prices['6M Ago'] else 'N/A',
-                                            f"{((current_price - historical_prices['YTD Start']) / historical_prices['YTD Start'] * 100):+.2f}%" if historical_prices['YTD Start'] else 'N/A',
-                                            f"{((current_price - historical_prices['1Y Ago']) / historical_prices['1Y Ago'] * 100):+.2f}%" if historical_prices['1Y Ago'] else 'N/A',
-                                            f"{((current_price - historical_prices['5Y Ago']) / historical_prices['5Y Ago'] * 100):+.2f}%" if historical_prices['5Y Ago'] else 'N/A'
+                                            f"{((current_price - historical_prices['1m']) / historical_prices['1m'] * 100):+.2f}%" if historical_prices['1m'] else 'N/A',
+                                            f"{((current_price - historical_prices['6m']) / historical_prices['6m'] * 100):+.2f}%" if historical_prices['6m'] else 'N/A',
+                                            f"{((current_price - historical_prices['ytd']) / historical_prices['ytd'] * 100):+.2f}%" if historical_prices['ytd'] else 'N/A',
+                                            f"{((current_price - historical_prices['1y']) / historical_prices['1y'] * 100):+.2f}%" if historical_prices['1y'] else 'N/A',
+                                            f"{((current_price - historical_prices['5y']) / historical_prices['5y'] * 100):+.2f}%" if historical_prices['5y'] else 'N/A'
                                         ]
                                     })
                                     
