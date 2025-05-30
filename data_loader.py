@@ -1,6 +1,7 @@
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
+from app import to_yahoo_ticker  # Import the helper function
 
 def get_stock_data(tickers, period="1y"):
     """
@@ -8,14 +9,16 @@ def get_stock_data(tickers, period="1y"):
     Always returns a DataFrame with MultiIndex columns: (Field, Ticker)
     """
     try:
-        data = yf.download(tickers, period=period, group_by='ticker')
+        # Convert tickers to Yahoo Finance format
+        yahoo_tickers = [to_yahoo_ticker(t) for t in tickers]
+        data = yf.download(yahoo_tickers, period=period, group_by='ticker')
         # If only one ticker, convert columns to MultiIndex
         if isinstance(tickers, str) or (isinstance(tickers, list) and len(tickers) == 1):
             ticker = tickers if isinstance(tickers, str) else tickers[0]
             data.columns = pd.MultiIndex.from_product([data.columns, [ticker]])
         return data
     except Exception as e:
-        print(f"Error fetching data: {e}")
+        print(f"Error downloading data: {str(e)}")
         return None
 
 def get_current_prices(tickers):
@@ -23,10 +26,12 @@ def get_current_prices(tickers):
     Get current prices for given tickers
     """
     try:
-        data = yf.download(tickers, period="1d", interval="1m")
+        # Convert tickers to Yahoo Finance format
+        yahoo_tickers = [to_yahoo_ticker(t) for t in tickers]
+        data = yf.download(yahoo_tickers, period="1d", interval="1m")
         return data['Close'].iloc[-1]
     except Exception as e:
-        print(f"Error fetching current prices: {e}")
+        print(f"Error downloading intraday data: {str(e)}")
         return None
 
 def calculate_portfolio_value(holdings):
