@@ -15,6 +15,26 @@ from numbers import Number
 from scipy.optimize import minimize
 from typing import Tuple
 
+# Initialize all required session state variables
+required_state_vars = [
+    'financial_data_cache', 'portfolio_created', 'show_charts',
+    'show_financials', 'show_monte_carlo', 'show_market_overview',
+    'custom_weight_inputs', 'ticker_info_cache', 'optimal_result',
+    'optimal_metrics', 'optimal_backtest', 'optimal_table',
+    'sector_map', 'missing_tickers', 'selected_tickers',
+    'risk_level', 'close_prices', 'portfolio_weights', 'ef_portfolios'
+]
+
+for var in required_state_vars:
+    if var not in st.session_state:
+        if var in ['financial_data_cache', 'ticker_info_cache']:
+            st.session_state[var] = {}
+        elif var in ['portfolio_created', 'show_charts', 'show_financials', 
+                    'show_monte_carlo', 'show_market_overview']:
+            st.session_state[var] = False
+        else:
+            st.session_state[var] = None
+
 @st.cache_data(ttl=3600)
 def get_historical_closes(ticker):
     """Get historical close prices for different time periods"""
@@ -1168,32 +1188,62 @@ with st.form("portfolio_input_form"):
     )
 
 def get_optimized_weights(mean_returns, cov_matrix, risk_level):
+    """Get optimized portfolio weights based on risk level"""
+    # Validate inputs
+    if not isinstance(mean_returns, (pd.Series, np.ndarray)) or len(mean_returns) == 0:
+        st.error("Invalid mean returns input")
+        return None
+        
+    if not isinstance(cov_matrix, (pd.DataFrame, np.ndarray)) or cov_matrix.size == 0:
+        st.error("Invalid covariance matrix input")
+        return None
+        
     n_assets = len(mean_returns)
-    args = (mean_returns, cov_matrix)
-
-    def portfolio_volatility(weights, mean_returns, cov_matrix):
-        return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-
-    def negative_sharpe(weights, mean_returns, cov_matrix, risk_free_rate=0.0):
-        port_return = np.dot(weights, mean_returns)
-        port_vol = portfolio_volatility(weights, mean_returns, cov_matrix)
-        return -(port_return - risk_free_rate) / port_vol if port_vol > 0 else 0
-
-    def negative_return(weights, mean_returns):
-        return -np.dot(weights, mean_returns)
-
-    constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
-    bounds = tuple((0, 1) for _ in range(n_assets))
-    initial_weights = np.array([1. / n_assets] * n_assets)
-
+    
+    # Check for NaN values
+    if np.isnan(mean_returns).any() or np.isnan(cov_matrix).any():
+        st.error("NaN values detected in inputs")
+        return np.array([1./n_assets] * n_assets)  # Return equal weights
+    
+    # Define constraints
+    constraints = [
+        {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}  # weights sum to 1
+    ]
+    bounds = tuple((0, 1) for _ in range(n_assets))  # weights between 0 and 1
+    
+    # Initial guess (equal weights)
+    initial_weights = np.array([1./n_assets] * n_assets)
+    
+    # Define objective function based on risk level
     if risk_level == "Low":
-        result = minimize(portfolio_volatility, initial_weights, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
-    elif risk_level == "Moderate":
-        result = minimize(negative_sharpe, initial_weights, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
-    else:  # High risk
-        result = minimize(negative_return, initial_weights, args=(mean_returns,), method='SLSQP', bounds=bounds, constraints=constraints)
-
-    return result.x if result.success else initial_weights
+        # Minimize volatility
+        objective = lambda x: portfolio_volatility(x, mean_returns, cov_matrix)
+    elif risk_level == "High":
+        # Maximize returns (minimize negative returns)
+        objective = lambda x: -portfolio_return(x, mean_returns)
+    else:  # Moderate
+        # Maximize Sharpe ratio (minimize negative Sharpe)
+        objective = lambda x: negative_sharpe(x, mean_returns, cov_matrix)
+    
+    # Optimize
+    try:
+        result = minimize(
+            objective,
+            initial_weights,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints
+        )
+        
+        if not result.success:
+            st.warning(f"Optimization did not converge: {result.message}")
+            return initial_weights
+            
+        return result.x
+        
+    except Exception as e:
+        st.error(f"Error during optimization: {str(e)}")
+        return initial_weights
 
 if create_portfolio and selected_tickers:
     # Convert years to date strings for yfinance
@@ -1213,88 +1263,87 @@ if create_portfolio and selected_tickers:
         n = len(selected_tickers)
         # Download price data with improved error handling
         with st.spinner("Downloading price data for optimization..."):
-            try:
-                # Try downloading each ticker individually first
-                valid_tickers = []
-                failed_tickers = []
-                
-                for ticker in selected_tickers:
-                    try:
-                        # Test download for each ticker
-                        test_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                        if test_data.empty:
-                            st.warning(f"No data returned for {ticker}")
-                            failed_tickers.append(ticker)
-                        else:
-                            valid_tickers.append(ticker)
-                    except Exception as e:
-                        st.warning(f"Failed to download {ticker}: {str(e)}")
-                        failed_tickers.append(ticker)
-                
-                if not valid_tickers:
-                    st.error("No valid tickers with data available")
-                    st.stop()
-                
-                # Now download all valid tickers together
-                data = yf.download(valid_tickers, start=start_date, end=end_date, interval="1d", threads=True)
-                
-                if data.empty:
-                    st.error(f"No data returned for valid tickers: {valid_tickers}")
-                    if failed_tickers:
-                        st.error(f"Failed tickers: {', '.join(failed_tickers)}")
-                    st.stop()
-                
-                # Store debug data
-                st.session_state['debug_data'] = data
-                
-                # Calculate returns and covariance
+            valid_tickers = []
+            failed_tickers = []
+            close_prices = []
+            
+            # Download each ticker individually with error handling
+            for ticker in selected_tickers:
                 try:
-                    close_prices = data['Adj Close']
-                    returns = close_prices.pct_change().dropna()
-                    mean_returns = returns.mean()
-                    cov_matrix = returns.cov()
-                    
-                    if mean_returns.empty or cov_matrix.empty:
-                        st.error("Optimization failed due to insufficient data:")
-                        if mean_returns.empty:
-                            st.error("- No return data calculated")
-                        if cov_matrix.empty:
-                            st.error("- No covariance matrix calculated")
+                    data = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                    if data.empty or 'Close' not in data.columns:
+                        failed_tickers.append(ticker)
+                        continue
                         
-                        # Show which tickers have data
-                        available_data = []
-                        for t in valid_tickers:
-                            try:
-                                if t in close_prices.columns:
-                                    available_data.append(f"{t}: {len(close_prices[t].dropna())} data points")
-                                else:
-                                    available_data.append(f"{t}: No data")
-                            except:
-                                available_data.append(f"{t}: Error checking")
-                        
-                        st.error("Data availability: " + ", ".join(available_data))
-                        st.stop()
-                    
-                    # Continue with optimization using valid_tickers instead of selected_tickers
-                    weights = get_optimized_weights(mean_returns, cov_matrix, risk_level)
-                    
-                    # Create portfolio DataFrame with only valid tickers
-                    portfolio = pd.DataFrame({
-                        'Ticker': valid_tickers,
-                        'Weight': weights
-                    })
-                    
-                    # Display results
-                    st.write("### Optimized Portfolio")
-                    st.write(portfolio)
-                    
+                    close_prices.append(data['Close'].rename(ticker))
+                    valid_tickers.append(ticker)
                 except Exception as e:
-                    st.error(f"Error calculating returns and covariance: {str(e)}")
-                    st.error(traceback.format_exc())
+                    failed_tickers.append(ticker)
+                    continue
+            
+            if not close_prices:
+                st.error("No valid data could be downloaded for any ticker")
+                st.stop()
+                
+            if failed_tickers:
+                st.warning(f"Failed to download data for: {', '.join(failed_tickers)}")
+                
+            # Combine all valid close prices
+            close_prices = pd.concat(close_prices, axis=1)
+            
+            # Calculate returns and covariance
+            try:
+                returns = close_prices.pct_change().dropna()
+                mean_returns = returns.mean()
+                cov_matrix = returns.cov()
+                
+                # Add debug information
+                if st.session_state.get('debug_mode', False):
+                    st.write("Debug Info - Mean Returns:", mean_returns)
+                    st.write("Debug Info - Covariance Matrix:", cov_matrix)
+                    st.write("Debug Info - Close Prices:", close_prices.head())
+                    st.write("Debug Info - Returns:", returns.head())
+                
+                if mean_returns.empty or cov_matrix.empty:
+                    st.error("Optimization failed due to insufficient data:")
+                    if mean_returns.empty:
+                        st.error("- No return data calculated")
+                    if cov_matrix.empty:
+                        st.error("- No covariance matrix calculated")
+                    
+                    # Show which tickers have data
+                    available_data = []
+                    for t in valid_tickers:
+                        try:
+                            if t in close_prices.columns:
+                                available_data.append(f"{t}: {len(close_prices[t].dropna())} data points")
+                            else:
+                                available_data.append(f"{t}: No data")
+                        except:
+                            available_data.append(f"{t}: Error checking")
+                    
+                    st.error("Data availability: " + ", ".join(available_data))
                     st.stop()
+                
+                # Continue with optimization using valid_tickers
+                weights = get_optimized_weights(mean_returns, cov_matrix, risk_level)
+                
+                if weights is None:
+                    st.error("Failed to calculate optimal weights")
+                    st.stop()
+                
+                # Create portfolio DataFrame with only valid tickers
+                portfolio = pd.DataFrame({
+                    'Ticker': valid_tickers,
+                    'Weight': weights
+                })
+                
+                # Display results
+                st.write("### Optimized Portfolio")
+                st.write(portfolio)
                 
             except Exception as e:
-                st.error(f"Error downloading data: {str(e)}")
+                st.error(f"Error calculating returns and covariance: {str(e)}")
                 st.error(traceback.format_exc())
                 st.stop()
 
