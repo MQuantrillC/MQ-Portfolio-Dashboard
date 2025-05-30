@@ -1210,23 +1210,70 @@ if create_portfolio and selected_tickers:
         valid_tickers = selected_tickers
     else:
         n = len(selected_tickers)
-        # Download price data for tickers to compute mean_returns and cov_matrix
+        # Download price data with improved error handling
         with st.spinner("Downloading price data for optimization..."):
-            data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
-        if isinstance(data.columns, pd.MultiIndex):
-            close_prices = pd.DataFrame({t: data['Close', t] for t in selected_tickers if ('Close', t) in data.columns})
-        else:
-            close_prices = pd.DataFrame({selected_tickers[0]: data['Close']})
-        close_prices = close_prices.dropna(axis=1, how='all').ffill().bfill()
-        returns = close_prices.pct_change().dropna()
-        mean_returns = returns.mean() * 252
-        cov_matrix = returns.cov() * 252
-        
-        # Add guard clause for empty data
-        if mean_returns.empty or cov_matrix.empty:
-            st.error("Not enough data to optimize portfolio. Please check your selected tickers and time range.")
-            st.stop()
+            try:
+                data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
+                st.session_state['debug_data'] = data  # Store for inspection
+                
+                if data.empty:
+                    st.error("No data returned from yfinance download")
+                    st.stop()
+                
+                # Debug output to show what data was received
+                if st.session_state.get('debug_mode', False):
+                    st.write("Raw downloaded data:", data)
+                
+            except Exception as e:
+                st.error(f"Error downloading data: {str(e)}")
+                st.error(traceback.format_exc())
+                st.stop()
+
+        # Check each ticker individually
+        st.write("Verifying data for each ticker...")
+        for ticker in selected_tickers:
+            try:
+                ticker_data = yf.download(ticker, start=start_date, end=end_date)
+                if ticker_data.empty:
+                    st.warning(f"No data found for {ticker} from {start_date} to {end_date}")
+                else:
+                    st.success(f"{ticker} has {len(ticker_data)} data points")
+            except Exception as e:
+                st.error(f"Error checking {ticker}: {str(e)}")
+
+        # Calculate returns and covariance with improved error handling
+        try:
+            close_prices = data['Adj Close']
+            returns = close_prices.pct_change().dropna()
+            mean_returns = returns.mean()
+            cov_matrix = returns.cov()
             
+            if mean_returns.empty or cov_matrix.empty:
+                st.error("Optimization failed due to insufficient data:")
+                if mean_returns.empty:
+                    st.error("- No return data calculated")
+                if cov_matrix.empty:
+                    st.error("- No covariance matrix calculated")
+                
+                # Show which tickers have data
+                available_data = []
+                for t in selected_tickers:
+                    try:
+                        if t in close_prices.columns:
+                            available_data.append(f"{t}: {len(close_prices[t].dropna())} data points")
+                        else:
+                            available_data.append(f"{t}: No data")
+                    except:
+                        available_data.append(f"{t}: Error checking")
+                
+                st.error("Data availability: " + ", ".join(available_data))
+                st.stop()
+                
+        except Exception as e:
+            st.error(f"Error calculating returns and covariance: {str(e)}")
+            st.error(traceback.format_exc())
+            st.stop()
+        
         weights = get_optimized_weights(mean_returns.values, cov_matrix.values, risk_level)
         custom_weights = {t: w * 100 for t, w in zip(selected_tickers, weights)}
     tickers = selected_tickers
