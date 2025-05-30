@@ -957,7 +957,7 @@ def get_sector_allocation_from_yfinance(tickers):
     for ticker in tickers:
         # First try yfinance
         try:
-            info = yf.Ticker(ticker).info
+            info = yf.Ticker(to_yahoo_ticker(ticker)).info
             sector = info.get("sector", None)
             if sector:
                 sector_map[ticker] = sector
@@ -1289,6 +1289,28 @@ if create_portfolio and selected_tickers:
                 # Display results
                 st.write("### Optimized Portfolio")
                 st.write(portfolio)
+                
+                # Download data for backtesting with proper ticker conversion
+                try:
+                    backtest_data = yf.download(
+                        [to_yahoo_ticker(t) for t in valid_tickers] + ["SPY"],
+                        start=start_date,
+                        end=end_date,
+                        interval="1d",
+                        threads=True
+                    )
+                    
+                    if backtest_data.empty:
+                        st.error("Failed to download backtest data")
+                        st.stop()
+                    
+                    # Store the data for later use
+                    st.session_state['backtest_data'] = backtest_data
+                    
+                except Exception as e:
+                    st.error(f"Error downloading backtest data: {str(e)}")
+                    st.error(traceback.format_exc())
+                    st.stop()
                 
             except Exception as e:
                 st.error(f"Error calculating returns and covariance: {str(e)}")
