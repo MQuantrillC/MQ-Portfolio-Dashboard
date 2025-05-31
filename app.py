@@ -5,6 +5,7 @@ import yfinance as yf
 import plotly.graph_objs as go
 from datetime import datetime
 import requests
+import kagglehub
 import os
 import plotly.express as px
 from collections import Counter
@@ -15,46 +16,38 @@ from numbers import Number
 from scipy.optimize import minimize
 from typing import Tuple
 
-# Initialize all required session state variables
-required_state_vars = [
-    'financial_data_cache', 'portfolio_created', 'show_charts',
-    'show_financials', 'show_monte_carlo', 'show_market_overview',
-    'custom_weight_inputs', 'ticker_info_cache', 'optimal_result',
-    'optimal_metrics', 'optimal_backtest', 'optimal_table',
-    'sector_map', 'missing_tickers', 'selected_tickers',
-    'risk_level', 'close_prices', 'portfolio_weights', 'ef_portfolios'
-]
-
-for var in required_state_vars:
-    if var not in st.session_state:
-        if var in ['financial_data_cache', 'ticker_info_cache']:
-            st.session_state[var] = {}
-        elif var in ['portfolio_created', 'show_charts', 'show_financials', 
-                    'show_monte_carlo', 'show_market_overview']:
-            st.session_state[var] = False
-        else:
-            st.session_state[var] = None
-
 @st.cache_data(ttl=3600)
 def get_historical_closes(ticker):
     """Get historical close prices for different time periods"""
     try:
         # Get current price
-        current_price = yf.Ticker(to_yahoo_ticker(ticker)).history(period="1d")["Close"].iloc[-1]
+        current_price = yf.Ticker(ticker).history(period="1d")["Close"].iloc[-1]
         
         # Get historical prices
-        five_d_ago = yf.Ticker(to_yahoo_ticker(ticker)).history(period="5d")["Close"].iloc[0]
-        one_m_ago = yf.Ticker(to_yahoo_ticker(ticker)).history(period="1mo")["Close"].iloc[0]
-        six_m_ago = yf.Ticker(to_yahoo_ticker(ticker)).history(period="6mo")["Close"].iloc[0]
+        five_d_ago = yf.Ticker(ticker).history(period="5d")["Close"].iloc[0]
+        one_m_ago = yf.Ticker(ticker).history(period="1mo")["Close"].iloc[0]
+        six_m_ago = yf.Ticker(ticker).history(period="6mo")["Close"].iloc[0]
+        
+        # For YTD, get first trading day of current year
+        today = datetime.now()
+        ytd_start = datetime(today.year, 1, 1).strftime('%Y-%m-%d')
+        ytd_price = yf.Ticker(ticker).history(start=ytd_start)["Close"].iloc[0]
+        
+        one_y_ago = yf.Ticker(ticker).history(period="1y")["Close"].iloc[0]
+        five_y_ago = yf.Ticker(ticker).history(period="5y")["Close"].iloc[0]
         
         return {
-            'current': current_price,
-            '5d': five_d_ago,
-            '1m': one_m_ago,
-            '6m': six_m_ago
+            "Current": current_price,
+            "5D Ago": five_d_ago,
+            "1M Ago": one_m_ago,
+            "6M Ago": six_m_ago,
+            "YTD Start": ytd_price,
+            "1Y Ago": one_y_ago,
+            "5Y Ago": five_y_ago
         }
     except Exception as e:
-        st.error(f"Error fetching historical prices for {ticker}: {str(e)}")
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error getting historical prices for {ticker}: {str(e)}")
         return None
 
 def get_spy_status_icon_and_label(change_percent: float, timeframe: str) -> Tuple[str, str]:
@@ -73,9 +66,9 @@ def get_spy_status_icon_and_label(change_percent: float, timeframe: str) -> Tupl
     if change_percent >= up_thresh:
         return "🟢", "Bullish"
     elif change_percent <= down_thresh:
-        return "🔴", "Bearish"
+            return "🔴", "Bearish"
     else:
-        return "🟡", "Neutral"
+            return "🟡", "Neutral"
 
 # Add helper functions for adaptive metrics
 def get_metric_labels(period_label):
@@ -164,15 +157,42 @@ def calculate_period_change(close_series, period_label):
 
 @st.cache_data(ttl=3600)
 def calculate_cached_period_change(ticker, period, interval):
-    """Calculate period change with caching"""
+    """Cached version of period change calculation with improved error handling"""
     try:
-        data = yf.download(to_yahoo_ticker(ticker), period=period, interval=interval)
-        if data.empty:
-            return None
-        return calculate_period_change(data['Close'], period)
+        # Get the period label from the period_options mapping
+        period_label = next((k for k, v in period_options.items() if v[0] == period), None)
+        if period_label is None:
+            if st.session_state.get('debug_mode', False):
+                st.error(f"Invalid period: {period}")
+            return None, None
+
+        # For intraday periods, ensure we get enough data
+        if period_label in ["1D", "5D"]:
+            # Add extra buffer for intraday data to ensure we have enough points
+            if period_label == "1D":
+                period = "2d"  # Get 2 days of data to ensure we have enough points
+            else:  # 5D
+                period = "6d"  # Get 6 days of data to ensure we have enough points
+
+        # Download data with progress=False to avoid UI clutter
+        data = yf.download(ticker, period=period, interval=interval, progress=False)
+        
+        if data.empty or 'Close' not in data.columns:
+            if st.session_state.get('debug_mode', False):
+                st.error(f"No data returned for {ticker}")
+            return None, None
+
+        # Get close prices and ensure we have a Series
+        close_series = data['Close'] if isinstance(data['Close'], pd.Series) else data['Close'].iloc[:, 0]
+        
+        # Calculate changes using the improved function
+        return calculate_period_change(close_series, period_label)
+        
     except Exception as e:
-        st.error(f"Error calculating period change for {ticker}: {str(e)}")
-        return None
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error in calculate_cached_period_change: {str(e)}")
+            st.error(traceback.format_exc())
+        return None, None
 
 # Set page to wide layout
 st.set_page_config(
@@ -399,60 +419,74 @@ def get_finnhub_sector_performance():
     except:
         return []
 
-@st.cache_data(ttl=86400)  # 24 hours for S&P 500 tickers
+@st.cache_data(ttl=86400)
 def get_sp500_tickers():
     """
-    Fetch S&P 500 tickers with sector info:
-    1. Try yFinance from ^GSPC components.
-    2. Fallback to maintained GitHub CSV.
-    Returns DataFrame with Symbol, Name, Sector, Industry columns
+    Fetch the list of S&P 500 tickers from multiple sources with fallbacks
     """
-    # Try yFinance first
     try:
-        sp500 = yf.Ticker("^GSPC")
-        components = sp500.components
-        if components is not None and not components.empty:
-            components.index = components.index.str.replace(".", "-", regex=False)
-            components = components.reset_index()
-            components.columns = ['Symbol', 'Name']
-            # Try to get sector info from yfinance
-            sectors = []
-            for ticker in components['Symbol']:
-                try:
-                    info = yf.Ticker(ticker).info
-                    sectors.append({
-                        'Sector': info.get('sector', 'Unknown'),
-                        'Industry': info.get('industry', 'Unknown')
-                    })
-                except:
-                    sectors.append({'Sector': 'Unknown', 'Industry': 'Unknown'})
-            sectors_df = pd.DataFrame(sectors)
-            return pd.concat([components, sectors_df], axis=1)
-    except Exception:
-        pass  # Fail silently and try fallback
-    
-    # Fallback: Use GitHub CSV
-    try:
-        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-        df = pd.read_csv(url)
-        df['Symbol'] = df['Symbol'].str.replace(".", "-", regex=False)
-        # Rename columns to match yfinance format
-        df = df.rename(columns={
-            'Security': 'Name',
-            'GICS Sector': 'Sector',
-            'GICS Sub-Industry': 'Industry'
-        })
-        return df[['Symbol', 'Name', 'Sector', 'Industry']]
+        # Try Wikipedia first
+        try:
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            payload = pd.read_html(url)
+            df = payload[0]
+            tickers = df["Symbol"].str.replace(".", "-", regex=False).str.upper().unique().tolist()
+            return sorted(tickers)
+        except Exception as wiki_error:
+            st.warning("Could not fetch S&P 500 tickers from Wikipedia. Trying GitHub fallback...")
+            
+        # GitHub fallback
+        try:
+            github_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+            df = pd.read_csv(github_url)
+            tickers = df["Symbol"].str.replace(".", "-", regex=False).str.upper().unique().tolist()
+            return sorted(tickers)
+        except Exception as github_error:
+            st.warning("Could not fetch S&P 500 tickers from GitHub. Using hardcoded fallback...")
+            
+        # Hardcoded fallback
+        fallback_tickers = [
+            "AAPL", "MSFT", "AMZN", "GOOG", "GOOGL", "META", "TSLA", "NVDA", 
+            "JPM", "JNJ", "V", "PG", "UNH", "HD", "MA", "DIS", "BAC", "PYPL", 
+            "CMCSA", "XOM", "PFE", "VZ", "ADBE", "CSCO", "KO", "PEP", "WMT", 
+            "MRK", "INTC", "NFLX", "T", "ABT", "CRM", "COST", "TMO", "ABBV", 
+            "AVGO", "ACN", "ORCL", "DHR", "QCOM", "NKE", "MDT", "BMY", "UNP", 
+            "PM", "LOW", "HON", "SBUX", "AMGN", "TXN", "IBM", "CVX", "CAT", 
+            "GS", "MMM", "UPS", "DE", "RTX", "GE", "F", "BA", "AMD", "NOW", 
+            "SPGI", "INTU", "ISRG", "BLK", "ADI", "GILD", "AMT", "PLD", "LMT", 
+            "BKNG", "MDLZ", "CI", "SCHW", "CB", "ZTS", "REGN", "TGT", "AXP", 
+            "MO", "SYK", "BDX", "CME", "DUK", "SO", "CL", "EL", "EQIX", "NEE", 
+            "VRTX", "APD", "BSX", "MMC", "AON", "ICE", "WM", "SHW", "ECL", 
+            "ITW", "ETN", "SLB", "KLAC", "FISV", "HUM", "ADP", "PSA", "PGR", 
+            "NOC", "MCD", "FDX", "EMR", "ROP", "GD", "AEP", "CCI", "NSC", 
+            "CSX", "EXC", "TJX", "OXY", "APTV", "MET", "AIG", "KMB", "PSX", 
+            "WELL", "STZ", "MCO", "CTVA", "COF", "VLO", "MSCI", "FIS", "A", 
+            "PPG", "GIS", "PRU", "ALL", "ROST", "PCAR", "CNC", "KMI", "ALGN", 
+            "WBA", "EBAY", "PAYX", "HLT", "YUM", "CDNS", "CHTR", "MAR", "MTD", 
+            "OKE", "DOW", "IDXX", "BIIB", "WEC", "ED", "PEG", "APH", "AZO", 
+            "AWK", "ANSS", "TDG", "DXCM", "DLTR", "EA", "VRSK", "IFF", "RMD", 
+            "ODFL", "FTNT", "WST", "CPRT", "CTSH", "LYB", "FAST", "EFX", "EQR", 
+            "MCHP", "RSG", "KEYS", "OTIS", "XYL", "TT", "HIG", "WY", "DHI", 
+            "HPE", "WAT", "NTRS", "GLW", "VMC", "CBRE", "BKR", "CARR", "DAL", 
+            "IR", "DTE", "FITB", "AFL", "STT", "SYF", "CF", "ES", "ULTA", 
+            "GPN", "EXR", "AMP", "TRV", "D", "EIX", "VICI", "NEM", "PKI", 
+            "MPWR", "DFS", "HAL", "ARE", "WAB", "RF", "GRMN", "EXPD", "MKC", 
+            "LUV", "TROW", "FTV", "PAYC", "AVB", "SWK", "IP", "SRE", "LDOS", 
+            "ZBH", "HWM", "ALB", "CTRA", "BR", "BBY", "FE", "CMS", "PFG", 
+            "BRO", "LVS", "CEG", "MAA", "J", "TYL", "DVN", "ETR", "HOLX", 
+            "FANG", "ACGL", "TSN", "CINF", "NDAQ", "HRL", "JBHT", "IEX", 
+            "PKG", "WRB", "MOH", "CPT", "BF-B", "CNP", "LNT", "UDR", "HST", 
+            "INCY", "VTR", "WDC", "APA", "LKQ", "BXP", "PNR", "FRT", "PEAK", 
+            "REG", "ATO", "BWA", "HAS", "NI", "UHS", "JKHY", "IPG", "NRG", 
+            "WHR", "PNW", "BBWI", "BEN", "RCL", "TXT", "DOV", "JNPR", "RL", 
+            "AES", "PHM", "NWSA", "NWS", "FOXA", "FOX", "NWL", "MOS", "PARA"
+        ]
+        return sorted(fallback_tickers)
+        
     except Exception as e:
-        st.warning(f"Could not fetch S&P 500 tickers: {str(e)}. Using fallback list.")
-        fallback = pd.DataFrame({
-            'Symbol': ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "PG"],
-            'Name': ["Apple", "Microsoft", "Alphabet", "Amazon", "Tesla", "Nvidia", "Meta", "JPMorgan", "Visa", "Procter & Gamble"],
-            'Sector': ["Technology"]*6 + ["Communication Services", "Financial Services", "Financial Services", "Consumer Defensive"],
-            'Industry': ["Consumer Electronics", "Software", "Internet Content", "E-Commerce", "Auto Manufacturers", "Semiconductors", 
-                        "Internet Content", "Banks", "Credit Services", "Household Products"]
-        })
-        return fallback
+        st.error(f"Critical error fetching S&P 500 tickers: {str(e)}")
+        return ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "PG"]
+
 
 @st.cache_data(ttl=3600)  # 1 hour for market data
 def get_top_movers(timeframe="1d"):
@@ -461,11 +495,12 @@ def get_top_movers(timeframe="1d"):
         # Get S&P 500 tickers
         try:
             sp500_tickers = get_sp500_tickers()
-            if not sp500_tickers.empty:
-                return sp500_tickers
+            if not sp500_tickers:
+                st.warning("Could not fetch S&P 500 tickers")
+                return [], []
         except Exception as e:
             st.warning(f"Error getting S&P 500 tickers: {str(e)}")
-            return pd.DataFrame()
+            return [], []
         
         # Limit to top 100 tickers for better performance
         sp500_tickers = sp500_tickers[:100]
@@ -490,7 +525,7 @@ def get_top_movers(timeframe="1d"):
         try:
             # Download data with MultiIndex structure and threading enabled
             data = yf.download(
-                sp500_tickers['Symbol'], 
+                sp500_tickers, 
                 period=period, 
                 interval=interval, 
                 group_by="ticker", 
@@ -501,7 +536,7 @@ def get_top_movers(timeframe="1d"):
             returns = {}
             failed_tickers = []
             
-            for ticker in sp500_tickers['Symbol']:
+            for ticker in sp500_tickers:
                 try:
                     # Handle both MultiIndex and flat index structures
                     if isinstance(data.columns, pd.MultiIndex):
@@ -531,14 +566,14 @@ def get_top_movers(timeframe="1d"):
                 
             if not returns:
                 st.warning("No valid return data found for selected timeframe.")
-                return pd.DataFrame()
+                return [], []
                 
             sorted_returns = sorted(returns.items(), key=lambda x: x[1], reverse=True)
-            return sp500_tickers.iloc[sorted_returns[:10].index]
+            return sorted_returns[:10], sorted_returns[-10:][::-1]
             
         except Exception as e:
             st.error(f"Error downloading market data: {str(e)}")
-            return pd.DataFrame()
+            return [], []
 
 @st.cache_data(ttl=3600)  # 1 hour for sector performance
 def get_sector_performance_custom(timeframe="1mo"):
@@ -806,14 +841,29 @@ def interpret_ratios(ratios):
 
 @st.cache_data(ttl=3600)  # 1 hour for asset price changes
 def get_asset_price_change(symbol: str, period: str = "1mo"):
-    """Get price change for an asset"""
+    import yfinance as yf
+    import numpy as np
+
     try:
-        data = yf.download(to_yahoo_ticker(symbol), period=period)
-        if data.empty:
+        data = yf.download(symbol, period=period, progress=False)
+        if data.empty or "Close" not in data.columns:
             return None
-        return calculate_period_change(data['Close'], period)
+
+        close_prices = data["Close"].dropna()
+        if len(close_prices) < 2:
+            return None
+
+        current_price = close_prices.iloc[-1]
+        old_price = close_prices.iloc[0]
+        pct_change = ((current_price - old_price) / old_price) * 100
+
+        return {
+            "symbol": symbol,
+            "current_price": current_price,
+            "pct_change": pct_change
+        }
     except Exception as e:
-        st.error(f"Error getting price change for {symbol}: {str(e)}")
+        print(f"Error loading {symbol}: {e}")
         return None
 
 # Monte Carlo Simulation Helper
@@ -880,6 +930,13 @@ if 'custom_tooltip_css' not in st.session_state:
 # Sidebar
 # st.sidebar.title("Portfolio Options")
 
+# Load Kaggle CSV for sector/industry fallback and sector allocation (make available globally)
+try:
+    kaggle_csv_path = os.path.join(kagglehub.dataset_download("andrewmvd/sp-500-stocks"), "sp500_stocks.csv")
+    kaggle_df = pd.read_csv(kaggle_csv_path)
+except Exception:
+    kaggle_df = None
+
 # Global constants
 BLUE_PALETTE = ['#1f77b4', '#2ca9e1', '#4dabf7', '#74c0fc', '#90d8fd', '#a5d8ff', '#c4e0ff', '#d6e9ff']
 
@@ -930,7 +987,7 @@ def get_financial_data(ticker, statement_type):
     cache_key = f"{ticker}_{statement_type}"
     if cache_key not in st.session_state['financial_data_cache']:
         try:
-            ticker_obj = yf.Ticker(to_yahoo_ticker(ticker))
+            ticker_obj = yf.Ticker(ticker)
             if statement_type == 'income':
                 data = ticker_obj.income_stmt
             elif statement_type == 'balance':
@@ -947,39 +1004,21 @@ def get_financial_data(ticker, statement_type):
 # Helper functions at the top
 @st.cache_data(ttl=86400)  # 24 hours for financial data
 def get_sector_allocation_from_yfinance(tickers):
-    """Get sector allocation using yfinance and fallback to GitHub data"""
-    # Get the full S&P 500 data
-    sp500_data = get_sp500_tickers()
-    
     sector_map = {}
     missing_tickers = []
-    
     for ticker in tickers:
-        # First try yfinance
         try:
-            info = yf.Ticker(to_yahoo_ticker(ticker)).info
+            info = yf.Ticker(ticker).info
             sector = info.get("sector", None)
             if sector:
                 sector_map[ticker] = sector
-                continue  # Found in yfinance, move to next ticker
+            else:
+                missing_tickers.append(ticker)
         except Exception:
-            pass
-        
-        # Fallback to GitHub data
-        ticker_row = sp500_data[sp500_data['Symbol'].str.upper() == ticker.upper()]
-        if not ticker_row.empty:
-            sector = ticker_row['Sector'].values[0]
-            if sector != 'Unknown':
-                sector_map[ticker] = sector
-                continue
-        
-        # If we get here, we couldn't find the sector
-        missing_tickers.append(ticker)
-    
+            missing_tickers.append(ticker)
     return sector_map, missing_tickers
 
 def to_yahoo_ticker(ticker):
-    """Convert ticker symbol to Yahoo Finance format"""
     return ticker.replace('.', '-')
 
 def format_market_cap(val):
@@ -1135,68 +1174,37 @@ with st.form("portfolio_input_form"):
     )
 
 def get_optimized_weights(mean_returns, cov_matrix, risk_level):
-    """Get optimized portfolio weights based on risk level"""
-    # Validate inputs
-    if not isinstance(mean_returns, (pd.Series, np.ndarray)) or len(mean_returns) == 0:
-        st.error("Invalid mean returns input")
-        return None
-        
-    if not isinstance(cov_matrix, (pd.DataFrame, np.ndarray)) or cov_matrix.size == 0:
-        st.error("Invalid covariance matrix input")
-        return None
-        
     n_assets = len(mean_returns)
-    
-    # Check for NaN values
-    if np.isnan(mean_returns).any() or np.isnan(cov_matrix).any():
-        st.error("NaN values detected in inputs")
-        return np.array([1./n_assets] * n_assets)  # Return equal weights
-    
-    # Define constraints
-    constraints = [
-        {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}  # weights sum to 1
-    ]
-    bounds = tuple((0, 1) for _ in range(n_assets))  # weights between 0 and 1
-    
-    # Initial guess (equal weights)
-    initial_weights = np.array([1./n_assets] * n_assets)
-    
-    # Define objective function based on risk level
+    args = (mean_returns, cov_matrix)
+
+    def portfolio_volatility(weights, mean_returns, cov_matrix):
+        return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+
+    def negative_sharpe(weights, mean_returns, cov_matrix, risk_free_rate=0.0):
+        port_return = np.dot(weights, mean_returns)
+        port_vol = portfolio_volatility(weights, mean_returns, cov_matrix)
+        return -(port_return - risk_free_rate) / port_vol if port_vol > 0 else 0
+
+    def negative_return(weights, mean_returns):
+        return -np.dot(weights, mean_returns)
+
+    constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+    bounds = tuple((0, 1) for _ in range(n_assets))
+    initial_weights = np.array([1. / n_assets] * n_assets)
+
     if risk_level == "Low":
-        # Minimize volatility
-        objective = lambda x: portfolio_volatility(x, mean_returns, cov_matrix)
-    elif risk_level == "High":
-        # Maximize returns (minimize negative returns)
-        objective = lambda x: -portfolio_return(x, mean_returns)
-    else:  # Moderate
-        # Maximize Sharpe ratio (minimize negative Sharpe)
-        objective = lambda x: negative_sharpe(x, mean_returns, cov_matrix)
-    
-    # Optimize
-    try:
-        result = minimize(
-            objective,
-            initial_weights,
-            method='SLSQP',
-            bounds=bounds,
-            constraints=constraints
-        )
-        
-        if not result.success:
-            st.warning(f"Optimization did not converge: {result.message}")
-            return initial_weights
-            
-        return result.x
-        
-    except Exception as e:
-        st.error(f"Error during optimization: {str(e)}")
-        return initial_weights
+        result = minimize(portfolio_volatility, initial_weights, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
+    elif risk_level == "Moderate":
+        result = minimize(negative_sharpe, initial_weights, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
+    else:  # High risk
+        result = minimize(negative_return, initial_weights, args=(mean_returns,), method='SLSQP', bounds=bounds, constraints=constraints)
+
+    return result.x if result.success else initial_weights
 
 if create_portfolio and selected_tickers:
     # Convert years to date strings for yfinance
     start_date = f"{st.session_state['start_year']}-01-01"
     end_date = f"{st.session_state['end_year']}-12-31"
-    
     if risk_level == "Custom":
         # Use custom weights from session state
         custom_weights = {t: st.session_state['custom_weight_inputs'].get(t, 0.0) for t in selected_tickers}
@@ -1208,160 +1216,23 @@ if create_portfolio and selected_tickers:
         valid_tickers = selected_tickers
     else:
         n = len(selected_tickers)
-        # Download price data with improved error handling
+        # Download price data for tickers to compute mean_returns and cov_matrix
         with st.spinner("Downloading price data for optimization..."):
-            valid_tickers = []
-            failed_tickers = []
-            close_prices = []
-            
-            # Download each ticker individually with error handling
-            for ticker in selected_tickers:
-                try:
-                    yahoo_ticker = to_yahoo_ticker(ticker)
-                    data = yf.download(yahoo_ticker, start=start_date, end=end_date, progress=False)
-                    if data.empty or 'Close' not in data.columns:
-                        failed_tickers.append(ticker)
-                        continue
-                        
-                    close_prices.append(data['Close'].rename(ticker))
-                    valid_tickers.append(ticker)
-                except Exception as e:
-                    failed_tickers.append(ticker)
-                    continue
-            
-            if not close_prices:
-                st.error("No valid data could be downloaded for any ticker")
-                st.stop()
-                
-            if failed_tickers:
-                st.warning(f"Failed to download data for: {', '.join(failed_tickers)}")
-                
-            # Combine all valid close prices
-            close_prices = pd.concat(close_prices, axis=1)
-            
-            # Calculate returns and covariance
-            try:
-                returns = close_prices.pct_change().dropna()
-                mean_returns = returns.mean()
-                cov_matrix = returns.cov()
-                
-                # Add debug information
-                if st.session_state.get('debug_mode', False):
-                    st.write("Debug Info - Mean Returns:", mean_returns)
-                    st.write("Debug Info - Covariance Matrix:", cov_matrix)
-                    st.write("Debug Info - Close Prices:", close_prices.head())
-                    st.write("Debug Info - Returns:", returns.head())
-                
-                if mean_returns.empty or cov_matrix.empty:
-                    st.error("Optimization failed due to insufficient data:")
-                    if mean_returns.empty:
-                        st.error("- No return data calculated")
-                    if cov_matrix.empty:
-                        st.error("- No covariance matrix calculated")
-                    
-                    # Show which tickers have data
-                    available_data = []
-                    for t in valid_tickers:
-                        try:
-                            if t in close_prices.columns:
-                                available_data.append(f"{t}: {len(close_prices[t].dropna())} data points")
-                            else:
-                                available_data.append(f"{t}: No data")
-                        except:
-                            available_data.append(f"{t}: Error checking")
-                    
-                    st.error("Data availability: " + ", ".join(available_data))
-                    st.stop()
-                
-                # Continue with optimization using valid_tickers
-                weights = get_optimized_weights(mean_returns, cov_matrix, risk_level)
-                
-                if weights is None:
-                    st.error("Failed to calculate optimal weights")
-                    st.stop()
-                
-                # Create portfolio DataFrame with only valid tickers
-                portfolio = pd.DataFrame({
-                    'Ticker': valid_tickers,
-                    'Weight': weights
-                })
-                
-                # Display results
-                st.write("### Optimized Portfolio")
-                st.write(portfolio)
-                
-                # Download data for backtesting with proper ticker conversion
-                try:
-                    backtest_data = yf.download(
-                        [to_yahoo_ticker(t) for t in valid_tickers] + ["SPY"],
-                        start=start_date,
-                        end=end_date,
-                        interval="1d",
-                        threads=True
-                    )
-                    
-                    if backtest_data.empty:
-                        st.error("Failed to download backtest data")
-                        st.stop()
-                    
-                    # Store the data for later use
-                    st.session_state['backtest_data'] = backtest_data
-                    
-                except Exception as e:
-                    st.error(f"Error downloading backtest data: {str(e)}")
-                    st.error(traceback.format_exc())
-                    st.stop()
-                
-            except Exception as e:
-                st.error(f"Error calculating returns and covariance: {str(e)}")
-                st.error(traceback.format_exc())
-                st.stop()
-
-        # Check each ticker individually
-        st.write("Verifying data for each ticker...")
-        for ticker in selected_tickers:
-            try:
-                ticker_data = yf.download(ticker, start=start_date, end=end_date)
-                if ticker_data.empty:
-                    st.warning(f"No data found for {ticker} from {start_date} to {end_date}")
-                else:
-                    st.success(f"{ticker} has {len(ticker_data)} data points")
-            except Exception as e:
-                st.error(f"Error checking {ticker}: {str(e)}")
-
-        # Calculate returns and covariance with improved error handling
-        try:
-            close_prices = data['Adj Close']
-            returns = close_prices.pct_change().dropna()
-            mean_returns = returns.mean()
-            cov_matrix = returns.cov()
-            
-            if mean_returns.empty or cov_matrix.empty:
-                st.error("Optimization failed due to insufficient data:")
-                if mean_returns.empty:
-                    st.error("- No return data calculated")
-                if cov_matrix.empty:
-                    st.error("- No covariance matrix calculated")
-                
-                # Show which tickers have data
-                available_data = []
-                for t in selected_tickers:
-                    try:
-                        if t in close_prices.columns:
-                            available_data.append(f"{t}: {len(close_prices[t].dropna())} data points")
-                        else:
-                            available_data.append(f"{t}: No data")
-                    except:
-                        available_data.append(f"{t}: Error checking")
-                
-                st.error("Data availability: " + ", ".join(available_data))
-                st.stop()
-                
-        except Exception as e:
-            st.error(f"Error calculating returns and covariance: {str(e)}")
-            st.error(traceback.format_exc())
-            st.stop()
+            data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
+        if isinstance(data.columns, pd.MultiIndex):
+            close_prices = pd.DataFrame({t: data['Close', t] for t in selected_tickers if ('Close', t) in data.columns})
+        else:
+            close_prices = pd.DataFrame({selected_tickers[0]: data['Close']})
+        close_prices = close_prices.dropna(axis=1, how='all').ffill().bfill()
+        returns = close_prices.pct_change().dropna()
+        mean_returns = returns.mean() * 252
+        cov_matrix = returns.cov() * 252
         
+        # Add guard clause for empty data
+        if mean_returns.empty or cov_matrix.empty:
+            st.error("Not enough data to optimize portfolio. Please check your selected tickers and time range.")
+            st.stop()
+            
         weights = get_optimized_weights(mean_returns.values, cov_matrix.values, risk_level)
         custom_weights = {t: w * 100 for t, w in zip(selected_tickers, weights)}
     tickers = selected_tickers
@@ -1912,6 +1783,7 @@ if st.session_state.get('portfolio_created'):
                         st.write(f"**95th Percentile (Best-Case):** ${p95_val:,.2f} {pct_str(p95_val)}")
 
 # --- Dashboard Sections ---
+# --- Dashboard Sections ---
 if st.session_state.get('portfolio_created'):
     # --- Charts Section ---
     if st.session_state.get('show_charts') and not st.session_state.get('show_financials') and not st.session_state.get('show_monte_carlo') and not st.session_state.get('show_market_overview'):
@@ -2010,7 +1882,7 @@ if st.session_state.get('portfolio_created'):
                         try:
                             yahoo_ticker = to_yahoo_ticker(ticker)
                             info = yf.Ticker(yahoo_ticker).info
-                            
+                                
                             if not info or info == {}:
                                 st.warning(f"No summary info found for {ticker}")
                             else:
@@ -2019,7 +1891,7 @@ if st.session_state.get('portfolio_created'):
                                 
                                 if historical_prices:
                                     # Current price
-                                    current_price = historical_prices["current"]
+                                    current_price = historical_prices["Current"]
                                     price_display = f"${current_price:,.2f}" if isinstance(current_price, (int, float)) else 'N/A'
                                     
                                     # Create the price display card
@@ -2037,18 +1909,18 @@ if st.session_state.get('portfolio_created'):
                                     hist_df = pd.DataFrame({
                                         "Period": ["1 Month Ago", "6 Months Ago", "YTD Start", "1 Year Ago", "5 Years Ago"],
                                         "Price": [
-                                            f"${historical_prices['1m']:,.2f}" if historical_prices['1m'] else 'N/A',
-                                            f"${historical_prices['6m']:,.2f}" if historical_prices['6m'] else 'N/A',
-                                            f"${historical_prices['ytd']:,.2f}" if historical_prices['ytd'] else 'N/A',
-                                            f"${historical_prices['1y']:,.2f}" if historical_prices['1y'] else 'N/A',
-                                            f"${historical_prices['5y']:,.2f}" if historical_prices['5y'] else 'N/A'
+                                            f"${historical_prices['1M Ago']:,.2f}" if historical_prices['1M Ago'] else 'N/A',
+                                            f"${historical_prices['6M Ago']:,.2f}" if historical_prices['6M Ago'] else 'N/A',
+                                            f"${historical_prices['YTD Start']:,.2f}" if historical_prices['YTD Start'] else 'N/A',
+                                            f"${historical_prices['1Y Ago']:,.2f}" if historical_prices['1Y Ago'] else 'N/A',
+                                            f"${historical_prices['5Y Ago']:,.2f}" if historical_prices['5Y Ago'] else 'N/A'
                                         ],
                                         "% Change": [
-                                            f"{((current_price - historical_prices['1m']) / historical_prices['1m'] * 100):+.2f}%" if historical_prices['1m'] else 'N/A',
-                                            f"{((current_price - historical_prices['6m']) / historical_prices['6m'] * 100):+.2f}%" if historical_prices['6m'] else 'N/A',
-                                            f"{((current_price - historical_prices['ytd']) / historical_prices['ytd'] * 100):+.2f}%" if historical_prices['ytd'] else 'N/A',
-                                            f"{((current_price - historical_prices['1y']) / historical_prices['1y'] * 100):+.2f}%" if historical_prices['1y'] else 'N/A',
-                                            f"{((current_price - historical_prices['5y']) / historical_prices['5y'] * 100):+.2f}%" if historical_prices['5y'] else 'N/A'
+                                            f"{((current_price - historical_prices['1M Ago']) / historical_prices['1M Ago'] * 100):+.2f}%" if historical_prices['1M Ago'] else 'N/A',
+                                            f"{((current_price - historical_prices['6M Ago']) / historical_prices['6M Ago'] * 100):+.2f}%" if historical_prices['6M Ago'] else 'N/A',
+                                            f"{((current_price - historical_prices['YTD Start']) / historical_prices['YTD Start'] * 100):+.2f}%" if historical_prices['YTD Start'] else 'N/A',
+                                            f"{((current_price - historical_prices['1Y Ago']) / historical_prices['1Y Ago'] * 100):+.2f}%" if historical_prices['1Y Ago'] else 'N/A',
+                                            f"{((current_price - historical_prices['5Y Ago']) / historical_prices['5Y Ago'] * 100):+.2f}%" if historical_prices['5Y Ago'] else 'N/A'
                                         ]
                                     })
                                     
@@ -2118,14 +1990,14 @@ if st.session_state.get('portfolio_created'):
                                 
                                 # Fallback to Kaggle CSV if missing
                                 if kaggle_df is not None:
-                                    ticker_row = kaggle_df[kaggle_df['Symbol'].str.upper() == ticker.upper()]
-                                    if not ticker_row.empty:
-                                        if sector == 'N/A':
-                                            sector = ticker_row['Sector'].values[0] if 'Sector' in ticker_row else 'N/A'
-                                        if industry == 'N/A':
-                                            industry = ticker_row['Industry'].values[0] if 'Industry' in ticker_row else 'N/A'
-                                        if employees == 'N/A' and 'Full Time Employees' in ticker_row:
-                                            employees = ticker_row['Full Time Employees'].values[0]
+                                    row = kaggle_df[kaggle_df['Symbol'].str.upper() == ticker.upper()]
+                                    if not row.empty:
+                                        if sector == 'N/A' and 'Sector' in row:
+                                            sector = row['Sector'].values[0]
+                                        if industry == 'N/A' and 'Industry' in row:
+                                            industry = row['Industry'].values[0]
+                                        if employees == 'N/A' and 'Full Time Employees' in row:
+                                            employees = row['Full Time Employees'].values[0]
                                 
                                 st.markdown(f"""
                                 <div style="margin-top: 20px; font-size: 0.9rem;">
