@@ -2,6 +2,8 @@ streamlit==1.32.0
 yfinance==0.2.36
 pandas==2.2.1
 numpy==1.26.4
+matplotlib==3.8.3
 plotly==5.19.0
-scipy==1.13.0; python_version < '3.13'
+scipy==1.12.0
 requests==2.31.0
+kagglehub==0.2.7 
