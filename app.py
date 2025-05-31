@@ -1218,7 +1218,25 @@ if create_portfolio and selected_tickers:
         n = len(selected_tickers)
         # Download price data for tickers to compute mean_returns and cov_matrix
         with st.spinner("Downloading price data for optimization..."):
-            data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
+            try:
+                data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
+                if data.empty:
+                    raise ValueError("yf.download() returned empty data.")
+            except Exception as e:
+                st.warning(f"⚠️ yf.download() failed, falling back to yf.Ticker().history(). Error: {e}")
+                data = {}
+                for ticker in selected_tickers:
+                    try:
+                        ticker_obj = yf.Ticker(ticker)
+                        df = ticker_obj.history(start=start_date, end=end_date, interval="1d")
+                        if not df.empty:
+                            data[ticker] = df["Close"]
+                        else:
+                            st.warning(f"No data for {ticker}")
+                    except Exception as e:
+                        st.warning(f"Failed to fetch {ticker} with fallback: {e}")
+                data = pd.DataFrame(data)
+
         if isinstance(data.columns, pd.MultiIndex):
             close_prices = pd.DataFrame({t: data['Close', t] for t in selected_tickers if ('Close', t) in data.columns})
         else:
