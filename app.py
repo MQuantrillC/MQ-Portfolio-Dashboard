@@ -422,16 +422,35 @@ def get_finnhub_sector_performance():
 @st.cache_data(ttl=86400)
 def get_sp500_tickers():
     """
-    Fetch the list of S&P 500 tickers from multiple sources with fallbacks
+    Fetch the list of S&P 500 tickers from multiple sources with fallbacks.
+    Supports both 'Symbol' and 'Ticker symbol' column names from Wikipedia.
     """
     try:
         # Try Wikipedia first
         try:
             url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            payload = pd.read_html(url)
-            df = payload[0]
-            tickers = df["Symbol"].str.replace(".", "-", regex=False).str.upper().unique().tolist()
+            tables = pd.read_html(url)
+            df = tables[0]  # First table contains the tickers
+            
+            # Handle different possible column names
+            if "Symbol" in df.columns:
+                symbol_col = "Symbol"
+            elif "Ticker symbol" in df.columns:
+                symbol_col = "Ticker symbol"
+            else:
+                raise ValueError("Couldn't find the ticker column in Wikipedia table")
+            
+            # Clean and convert symbols
+            tickers = (
+                df[symbol_col]
+                .astype(str)
+                .str.replace(".", "-", regex=False)  # Yahoo uses "-" instead of "."
+                .str.upper()
+                .unique()
+                .tolist()
+            )
             return sorted(tickers)
+            
         except Exception as wiki_error:
             st.warning("Could not fetch S&P 500 tickers from Wikipedia. Trying GitHub fallback...")
             
@@ -439,7 +458,14 @@ def get_sp500_tickers():
         try:
             github_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
             df = pd.read_csv(github_url)
-            tickers = df["Symbol"].str.replace(".", "-", regex=False).str.upper().unique().tolist()
+            tickers = (
+                df["Symbol"]
+                .astype(str)
+                .str.replace(".", "-", regex=False)
+                .str.upper()
+                .unique()
+                .tolist()
+            )
             return sorted(tickers)
         except Exception as github_error:
             st.warning("Could not fetch S&P 500 tickers from GitHub. Using hardcoded fallback...")
@@ -1037,9 +1063,6 @@ def format_market_cap(val):
     except Exception:
         return 'N/A'
 
-# Cache and reuse all_tickers
-all_tickers = get_sp500_tickers()
-
 # Period selector (now above charts, not in sidebar)
 period_options = {
     "1D": ("1d", "15m"),  # Changed interval from 5m to 15m for 1D
@@ -1136,7 +1159,7 @@ st.session_state['end_year'] = end_year
 with st.form("portfolio_input_form"):
     selected_tickers = st.multiselect(
         "Stock Tickers",
-        options=all_tickers,
+        options=get_sp500_tickers(),  # Call the function directly here
         default=["AAPL", "TSLA", "MSFT"],
         help="Start typing to search and select tickers from the S&P 500."
     )
