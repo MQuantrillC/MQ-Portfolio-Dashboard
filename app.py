@@ -4,8 +4,8 @@ import pandas as pd
 import yfinance as yf
 import plotly.graph_objs as go
 from datetime import datetime
-import requests
 import kagglehub
+import requests
 import os
 import plotly.express as px
 from collections import Counter
@@ -15,6 +15,8 @@ from functools import lru_cache
 from numbers import Number
 from scipy.optimize import minimize
 from typing import Tuple
+from bs4 import BeautifulSoup
+from fp.fp import FreeProxy
 
 @st.cache_data(ttl=3600)
 def get_historical_closes(ticker):
@@ -66,9 +68,9 @@ def get_spy_status_icon_and_label(change_percent: float, timeframe: str) -> Tupl
     if change_percent >= up_thresh:
         return "🟢", "Bullish"
     elif change_percent <= down_thresh:
-            return "🔴", "Bearish"
+        return "🔴", "Bearish"
     else:
-            return "🟡", "Neutral"
+        return "🟡", "Neutral"
 
 # Add helper functions for adaptive metrics
 def get_metric_labels(period_label):
@@ -381,138 +383,117 @@ if 'portfolio_weights' not in st.session_state:
 if 'ef_portfolios' not in st.session_state:
     st.session_state['ef_portfolios'] = None
 
-# Finnhub API key (temporary, should be moved to secrets.toml)
-finnhub_api_key = "d0r448pr01qn4tjgbsfgd0r448pr01qn4tjgbsg0"
 
-def get_finnhub_top_movers(direction='gainers', count=10):
-    """Get top gainers or losers from Finnhub"""
-    url = f"https://finnhub.io/api/v1/news?category=general&token={finnhub_api_key}"
-    mover_url = "https://finnhub.io/api/v1/scan/technical-indicator"
-    response = requests.get("https://finnhub.io/api/v1/stock/symbol?exchange=US&token=" + finnhub_api_key)
-    if response.status_code != 200:
-        return []
 
-    all_tickers = [x['symbol'] for x in response.json() if x['type'] == 'Common Stock']
-    movers = []
-
-    for symbol in all_tickers[:100]:  # limit for testing
-        try:
-            quote = requests.get(f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={finnhub_api_key}").json()
-            change = ((quote["c"] - quote["pc"]) / quote["pc"]) * 100 if quote["pc"] else 0
-            movers.append((symbol, change))
-        except:
-            continue
-
-    sorted_movers = sorted(movers, key=lambda x: x[1], reverse=True)
-    if direction == "gainers":
-        return sorted_movers[:count]
-    else:
-        return sorted_movers[-count:][::-1]
-
-def get_finnhub_sector_performance():
-    """Get sector performance from Finnhub"""
-    url = f"https://finnhub.io/api/v1/stock/sector-performance?token={finnhub_api_key}"
-    try:
-        response = requests.get(url)
-        data = response.json()
-        return [(x['sector'], x['performance']) for x in data]
-    except:
-        return []
-
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400)  # Cache for 24 hours
 def get_sp500_tickers():
     """
-    Fetch the list of S&P 500 tickers from multiple sources with fallbacks.
-    Supports both 'Symbol' and 'Ticker symbol' column names from Wikipedia.
+    Fetch S&P 500 tickers using multiple reliable methods with proxy support
+    Returns sorted list of tickers or fallback list if all methods fail
     """
+    # Method 1: Wikipedia (most reliable)
     try:
-        # Try Wikipedia first
-        try:
-            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            tables = pd.read_html(url)
-            df = tables[0]  # First table contains the tickers
-            
-            # Handle different possible column names
-            if "Symbol" in df.columns:
-                symbol_col = "Symbol"
-            elif "Ticker symbol" in df.columns:
-                symbol_col = "Ticker symbol"
-            else:
-                raise ValueError("Couldn't find the ticker column in Wikipedia table")
-            
-            # Clean and convert symbols
-            tickers = (
-                df[symbol_col]
-                .astype(str)
-                .str.replace(".", "-", regex=False)  # Yahoo uses "-" instead of "."
-                .str.upper()
-                .unique()
-                .tolist()
-            )
-            return sorted(tickers)
-            
-        except Exception as wiki_error:
-            st.warning("Could not fetch S&P 500 tickers from Wikipedia. Trying GitHub fallback...")
-            
-        # GitHub fallback
-        try:
-            github_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-            df = pd.read_csv(github_url)
-            tickers = (
-                df["Symbol"]
-                .astype(str)
-                .str.replace(".", "-", regex=False)
-                .str.upper()
-                .unique()
-                .tolist()
-            )
-            return sorted(tickers)
-        except Exception as github_error:
-            st.warning("Could not fetch S&P 500 tickers from GitHub. Using hardcoded fallback...")
-            
-        # Hardcoded fallback
-        fallback_tickers = [
-            "AAPL", "MSFT", "AMZN", "GOOG", "GOOGL", "META", "TSLA", "NVDA", 
-            "JPM", "JNJ", "V", "PG", "UNH", "HD", "MA", "DIS", "BAC", "PYPL", 
-            "CMCSA", "XOM", "PFE", "VZ", "ADBE", "CSCO", "KO", "PEP", "WMT", 
-            "MRK", "INTC", "NFLX", "T", "ABT", "CRM", "COST", "TMO", "ABBV", 
-            "AVGO", "ACN", "ORCL", "DHR", "QCOM", "NKE", "MDT", "BMY", "UNP", 
-            "PM", "LOW", "HON", "SBUX", "AMGN", "TXN", "IBM", "CVX", "CAT", 
-            "GS", "MMM", "UPS", "DE", "RTX", "GE", "F", "BA", "AMD", "NOW", 
-            "SPGI", "INTU", "ISRG", "BLK", "ADI", "GILD", "AMT", "PLD", "LMT", 
-            "BKNG", "MDLZ", "CI", "SCHW", "CB", "ZTS", "REGN", "TGT", "AXP", 
-            "MO", "SYK", "BDX", "CME", "DUK", "SO", "CL", "EL", "EQIX", "NEE", 
-            "VRTX", "APD", "BSX", "MMC", "AON", "ICE", "WM", "SHW", "ECL", 
-            "ITW", "ETN", "SLB", "KLAC", "FISV", "HUM", "ADP", "PSA", "PGR", 
-            "NOC", "MCD", "FDX", "EMR", "ROP", "GD", "AEP", "CCI", "NSC", 
-            "CSX", "EXC", "TJX", "OXY", "APTV", "MET", "AIG", "KMB", "PSX", 
-            "WELL", "STZ", "MCO", "CTVA", "COF", "VLO", "MSCI", "FIS", "A", 
-            "PPG", "GIS", "PRU", "ALL", "ROST", "PCAR", "CNC", "KMI", "ALGN", 
-            "WBA", "EBAY", "PAYX", "HLT", "YUM", "CDNS", "CHTR", "MAR", "MTD", 
-            "OKE", "DOW", "IDXX", "BIIB", "WEC", "ED", "PEG", "APH", "AZO", 
-            "AWK", "ANSS", "TDG", "DXCM", "DLTR", "EA", "VRSK", "IFF", "RMD", 
-            "ODFL", "FTNT", "WST", "CPRT", "CTSH", "LYB", "FAST", "EFX", "EQR", 
-            "MCHP", "RSG", "KEYS", "OTIS", "XYL", "TT", "HIG", "WY", "DHI", 
-            "HPE", "WAT", "NTRS", "GLW", "VMC", "CBRE", "BKR", "CARR", "DAL", 
-            "IR", "DTE", "FITB", "AFL", "STT", "SYF", "CF", "ES", "ULTA", 
-            "GPN", "EXR", "AMP", "TRV", "D", "EIX", "VICI", "NEM", "PKI", 
-            "MPWR", "DFS", "HAL", "ARE", "WAB", "RF", "GRMN", "EXPD", "MKC", 
-            "LUV", "TROW", "FTV", "PAYC", "AVB", "SWK", "IP", "SRE", "LDOS", 
-            "ZBH", "HWM", "ALB", "CTRA", "BR", "BBY", "FE", "CMS", "PFG", 
-            "BRO", "LVS", "CEG", "MAA", "J", "TYL", "DVN", "ETR", "HOLX", 
-            "FANG", "ACGL", "TSN", "CINF", "NDAQ", "HRL", "JBHT", "IEX", 
-            "PKG", "WRB", "MOH", "CPT", "BF-B", "CNP", "LNT", "UDR", "HST", 
-            "INCY", "VTR", "WDC", "APA", "LKQ", "BXP", "PNR", "FRT", "PEAK", 
-            "REG", "ATO", "BWA", "HAS", "NI", "UHS", "JKHY", "IPG", "NRG", 
-            "WHR", "PNW", "BBWI", "BEN", "RCL", "TXT", "DOV", "JNPR", "RL", 
-            "AES", "PHM", "NWSA", "NWS", "FOXA", "FOX", "NWL", "MOS", "PARA"
-        ]
-        return sorted(fallback_tickers)
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
         
+        # Try with proxy first
+        try:
+            proxy = FreeProxy(rand=True).get()
+            proxies = {"http": proxy, "https": proxy}
+            response = requests.get(url, headers=headers, proxies=proxies, timeout=10)
+        except:
+            response = requests.get(url, headers=headers, timeout=10)
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find the correct table - more robust selection
+        table = soup.find('table', {'id': 'constituents'})
+        if not table:
+            tables = soup.find_all('table')
+            table = next((t for t in tables if len(t.find_all('tr')) > 400), None)
+        
+        if table:
+            symbols = []
+            rows = table.find_all('tr')[1:]  # Skip header
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) > 0:
+                    symbol = cells[0].text.strip()
+                    # Handle cases like BRK.B -> BRK-B
+                    symbol = symbol.replace('.', '-')
+                    if symbol and len(symbol) <= 10:  # Basic validation
+                        symbols.append(symbol)
+            
+            if len(symbols) > 400:  # Sanity check
+                return sorted(symbols)
+                
     except Exception as e:
-        st.error(f"Critical error fetching S&P 500 tickers: {str(e)}")
-        return ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "PG"]
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Wikipedia method failed: {str(e)}")
 
+    # Method 2: StockAnalysis.com (alternative source)
+    try:
+        url = "https://stockanalysis.com/list/sp-500-stocks/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        # Try with proxy first
+        try:
+            proxy = FreeProxy(rand=True).get()
+            proxies = {"http": proxy, "https": proxy}
+            response = requests.get(url, headers=headers, proxies=proxies, timeout=10)
+        except:
+            response = requests.get(url, headers=headers, timeout=10)
+        
+        # Use pandas to parse the table
+        tables = pd.read_html(response.text)
+        for table in tables:
+            if 'Symbol' in table.columns:
+                symbols = table['Symbol'].dropna().astype(str).tolist()
+                symbols = [s.replace('.', '-').strip() for s in symbols if s and len(s) <= 10]
+                if len(symbols) > 400:
+                    return sorted(symbols)
+                    
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"StockAnalysis method failed: {str(e)}")
+
+    # Method 3: NASDAQ API (official source)
+    try:
+        url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=500&exchange=nasdaq&exchange=nyse&exchange=amex"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json"
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        data = response.json()
+        
+        if data and 'data' in data and 'rows' in data['data']:
+            symbols = [row['symbol'] for row in data['data']['rows'] 
+                      if row['marketCap'] and float(row['marketCap']) >= 10_000_000_000]  # Filter for large caps
+            symbols = [s.replace('.', '-').strip() for s in symbols if s and len(s) <= 10]
+            if len(symbols) > 400:
+                return sorted(symbols)
+                
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"NASDAQ API method failed: {str(e)}")
+
+    # Last resort: Hardcoded list of top 50 S&P 500 stocks
+    fallback = [
+        "AAPL", "MSFT", "AMZN", "GOOG", "GOOGL", "META", "TSLA", "NVDA", "BRK-B", "JPM", 
+        "V", "JNJ", "WMT", "PG", "MA", "UNH", "HD", "DIS", "BAC", "PYPL", 
+        "VZ", "CMCSA", "ADBE", "NFLX", "CRM", "PEP", "KO", "T", "ABT", "INTC", 
+        "ORCL", "CSCO", "AVGO", "QCOM", "TXN", "NKE", "MRK", "PFE", "WFC", "UPS", 
+        "MS", "RTX", "IBM", "MMM", "GE", "F", "GM", "TGT", "LOW", "COST"
+    ]
+    
+    st.warning("Could not fetch S&P 500 tickers from any source. Using fallback list.")
+    return sorted(fallback)
 
 @st.cache_data(ttl=3600)  # 1 hour for market data
 def get_top_movers(timeframe="1d"):
@@ -1063,6 +1044,9 @@ def format_market_cap(val):
     except Exception:
         return 'N/A'
 
+# Cache and reuse all_tickers
+all_tickers = get_sp500_tickers()
+
 # Period selector (now above charts, not in sidebar)
 period_options = {
     "1D": ("1d", "15m"),  # Changed interval from 5m to 15m for 1D
@@ -1159,7 +1143,7 @@ st.session_state['end_year'] = end_year
 with st.form("portfolio_input_form"):
     selected_tickers = st.multiselect(
         "Stock Tickers",
-        options=get_sp500_tickers(),  # Call the function directly here
+        options=all_tickers,
         default=["AAPL", "TSLA", "MSFT"],
         help="Start typing to search and select tickers from the S&P 500."
     )
@@ -1241,25 +1225,7 @@ if create_portfolio and selected_tickers:
         n = len(selected_tickers)
         # Download price data for tickers to compute mean_returns and cov_matrix
         with st.spinner("Downloading price data for optimization..."):
-            try:
-                data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
-                if data.empty:
-                    raise ValueError("yf.download() returned empty data.")
-            except Exception as e:
-                st.warning(f"⚠️ yf.download() failed, falling back to yf.Ticker().history(). Error: {e}")
-                data = {}
-                for ticker in selected_tickers:
-                    try:
-                        ticker_obj = yf.Ticker(ticker)
-                        df = ticker_obj.history(start=start_date, end=end_date, interval="1d")
-                        if not df.empty:
-                            data[ticker] = df["Close"]
-                        else:
-                            st.warning(f"No data for {ticker}")
-                    except Exception as e:
-                        st.warning(f"Failed to fetch {ticker} with fallback: {e}")
-                data = pd.DataFrame(data)
-
+            data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
         if isinstance(data.columns, pd.MultiIndex):
             close_prices = pd.DataFrame({t: data['Close', t] for t in selected_tickers if ('Close', t) in data.columns})
         else:
@@ -1275,12 +1241,15 @@ if create_portfolio and selected_tickers:
             st.stop()
             
         weights = get_optimized_weights(mean_returns.values, cov_matrix.values, risk_level)
-        custom_weights = {t: w * 100 for t, w in zip(selected_tickers, weights)}
-    tickers = selected_tickers
+        valid_tickers = list(close_prices.columns)  # Use only tickers with valid data
+        custom_weights = {t: w * 100 for t, w in zip(valid_tickers, weights)}
+    
+    # Use only valid tickers that have data
+    tickers = valid_tickers
     allocation = {tickers[i]: weights[i] * 100 for i in range(len(tickers))}
     st.session_state['optimal_result'] = allocation
     st.session_state['portfolio_created'] = True
-    st.session_state['selected_tickers'] = selected_tickers
+    st.session_state['selected_tickers'] = tickers  # Store only valid tickers
     st.session_state['risk_level'] = risk_level
     # Store close_prices and weights in session state for later use
     st.session_state['close_prices'] = close_prices
@@ -1824,7 +1793,6 @@ if st.session_state.get('portfolio_created'):
                         st.write(f"**95th Percentile (Best-Case):** ${p95_val:,.2f} {pct_str(p95_val)}")
 
 # --- Dashboard Sections ---
-# --- Dashboard Sections ---
 if st.session_state.get('portfolio_created'):
     # --- Charts Section ---
     if st.session_state.get('show_charts') and not st.session_state.get('show_financials') and not st.session_state.get('show_monte_carlo') and not st.session_state.get('show_market_overview'):
@@ -1923,7 +1891,7 @@ if st.session_state.get('portfolio_created'):
                         try:
                             yahoo_ticker = to_yahoo_ticker(ticker)
                             info = yf.Ticker(yahoo_ticker).info
-                                
+                            
                             if not info or info == {}:
                                 st.warning(f"No summary info found for {ticker}")
                             else:
