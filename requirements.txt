@@ -7,4 +7,4 @@ matplotlib
 scipy
 requests
 beautifulsoup4
-fp.fp
+free_proxy
