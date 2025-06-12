@@ -830,8 +830,12 @@ def display_optimal_portfolio(tickers: List[str]):
         # --- Robust parallel info fetching ---
         with st.spinner("Fetching company info for all tickers..."):
             raw_info_dict = fetch_multiple_stock_info_robust(tickers, max_workers=3)
-            # Validate and clean the data
-            info_dict = {ticker: validate_stock_data(raw_info_dict.get(ticker), ticker) for ticker in tickers}
+            # Validate, enrich, and clean the data
+            info_dict = {}
+            for ticker in tickers:
+                validated_data = validate_stock_data(raw_info_dict.get(ticker), ticker)
+                enriched_data = enrich_stock_data(validated_data, ticker)
+                info_dict[ticker] = enriched_data
         
         returns_data = {}
         valid_tickers = []  # Track tickers with valid data
@@ -1102,7 +1106,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
                     # Income Statement Tab
                     with statement_tabs[0]:
                         with st.spinner(f"Loading {ticker} Income Statement..."):
-                            income_stmt = fetch_financial_statement(ticker, "income", "Annual")
+                            income_stmt = fetch_financial_statement_robust(ticker, "income", "Annual")
                             if income_stmt is not None and not income_stmt.empty:
                                 # Initialize filtered_data with correct columns
                                 filtered_data = pd.DataFrame(columns=income_stmt.columns)
@@ -1123,7 +1127,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
                     # Balance Sheet Tab
                     with statement_tabs[1]:
                         with st.spinner(f"Loading {ticker} Balance Sheet..."):
-                            balance_sheet = fetch_financial_statement(ticker, "balance", "Annual")
+                            balance_sheet = fetch_financial_statement_robust(ticker, "balance", "Annual")
                             if balance_sheet is not None and not balance_sheet.empty:
                                 # Initialize filtered_data with correct columns
                                 filtered_data = pd.DataFrame(columns=balance_sheet.columns)
@@ -1144,7 +1148,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
                     # Cash Flow Tab
                     with statement_tabs[2]:
                         with st.spinner(f"Loading {ticker} Cash Flow Statement..."):
-                            cash_flow = fetch_financial_statement(ticker, "cashflow", "Annual")
+                            cash_flow = fetch_financial_statement_robust(ticker, "cashflow", "Annual")
                             if cash_flow is not None and not cash_flow.empty:
                                 # Initialize filtered_data with correct columns
                                 filtered_data = pd.DataFrame(columns=cash_flow.columns)
@@ -1337,7 +1341,7 @@ def get_market_indicators() -> Dict[str, Dict[str, Union[float, str]]]:
         indicators = {}
         
         # Fetch SPY data for S&P 500
-        spy_data = fetch_stock_history("SPY", period="1d")
+        spy_data = fetch_stock_history_robust("SPY", period="1d")
         if spy_data is not None and not spy_data.empty:
             spy_close = spy_data['Close'].iloc[-1]
             spy_change = ((spy_close - spy_data['Open'].iloc[0]) / spy_data['Open'].iloc[0]) * 100
@@ -1349,7 +1353,7 @@ def get_market_indicators() -> Dict[str, Dict[str, Union[float, str]]]:
             }
         
         # Fetch VIX data
-        vix_data = fetch_stock_history("^VIX", period="1d")
+        vix_data = fetch_stock_history_robust("^VIX", period="1d")
         if vix_data is not None and not vix_data.empty:
             vix_close = vix_data['Close'].iloc[-1]
             vix_change = ((vix_close - vix_data['Open'].iloc[0]) / vix_data['Open'].iloc[0]) * 100
@@ -1361,7 +1365,7 @@ def get_market_indicators() -> Dict[str, Dict[str, Union[float, str]]]:
             }
         
         # Fetch 10Y Treasury Yield
-        treasury_data = fetch_stock_history("^TNX", period="1d")
+        treasury_data = fetch_stock_history_robust("^TNX", period="1d")
         if treasury_data is not None and not treasury_data.empty:
             treasury_close = treasury_data['Close'].iloc[-1]
             treasury_change = ((treasury_close - treasury_data['Open'].iloc[0]) / treasury_data['Open'].iloc[0]) * 100
@@ -1454,9 +1458,9 @@ def fetch_data_for_timeframe(ticker: str, mo_period: Optional[str], mo_interval:
     if market_tf == "YTD":
         current_year = datetime.today().year
         start_date = datetime(current_year, 1, 1)
-        return fetch_stock_history(ticker, start=start_date, end=datetime.today(), interval=mo_interval)
+        return fetch_stock_history_robust(ticker, start=start_date, end=datetime.today(), interval=mo_interval)
     else:
-        return fetch_stock_history(ticker, period=mo_period, interval=mo_interval)
+        return fetch_stock_history_robust(ticker, period=mo_period, interval=mo_interval)
 
 def display_market_overview():
     st.markdown("## Market Overview")
@@ -1914,7 +1918,8 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
 def display_ticker_info(ticker: str):
     """Display detailed information for a single ticker"""
     raw_info = fetch_stock_info_robust(ticker)
-    info = validate_stock_data(raw_info, ticker)
+    validated_info = validate_stock_data(raw_info, ticker)
+    info = enrich_stock_data(validated_info, ticker)
     
     if not info or info.get('quoteType') is None:
         st.error(f"Could not fetch information for {ticker}")
@@ -3127,23 +3132,15 @@ def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]
         try:
             yf.set_config(proxy=None)
             ticker_obj = yf.Ticker(ticker)
-            time.sleep(0.1)  # Small delay to respect rate limits
+            time.sleep(0.1 * (attempt + 1))  # Progressive delay
             
             info = ticker_obj.info
-            if info and len(info) > 5 and "quoteType" in info:  # Ensure we got real data
-                return info
-                
-            # Try fast_info as fallback
-            if hasattr(ticker_obj, 'fast_info'):
-                fast_info = ticker_obj.fast_info
-                if fast_info and hasattr(fast_info, 'last_price'):
-                    # Convert fast_info to dict format
-                    return {
-                        'currentPrice': getattr(fast_info, 'last_price', None),
-                        'marketCap': getattr(fast_info, 'market_cap', None),
-                        'shortName': ticker,
-                        'quoteType': 'EQUITY'
-                    }
+            # More lenient check - accept if we have basic data
+            if info and isinstance(info, dict) and len(info) > 3:
+                # Check if we have meaningful data (not just error responses)
+                if any(key in info for key in ['currentPrice', 'regularMarketPrice', 'shortName', 'longName']):
+                    return info
+                    
         except Exception as e:
             if st.session_state.get('debug_mode', False) and attempt == max_retries - 1:
                 st.warning(f"No proxy attempt {attempt+1} failed for {ticker}: {str(e)[:100]}")
@@ -3157,15 +3154,37 @@ def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]
                 if proxy:
                     yf.set_config(proxy=proxy)
                     ticker_obj = yf.Ticker(ticker)
-                    time.sleep(0.2)
+                    time.sleep(0.3)
                     
                     info = ticker_obj.info
-                    if info and len(info) > 5 and "quoteType" in info:
-                        return info
+                    if info and isinstance(info, dict) and len(info) > 3:
+                        if any(key in info for key in ['currentPrice', 'regularMarketPrice', 'shortName', 'longName']):
+                            return info
             except Exception as e:
                 if st.session_state.get('debug_mode', False) and attempt == 1:
                     st.warning(f"Proxy attempt failed for {ticker}: {str(e)[:100]}")
                 time.sleep(1.0)
+    
+    # Strategy 3: Try fast_info as last resort
+    try:
+        yf.set_config(proxy=None)
+        ticker_obj = yf.Ticker(ticker)
+        if hasattr(ticker_obj, 'fast_info'):
+            fast_info = ticker_obj.fast_info
+            if fast_info and hasattr(fast_info, 'last_price'):
+                # Convert fast_info to dict format with more fields
+                return {
+                    'currentPrice': getattr(fast_info, 'last_price', None),
+                    'regularMarketPrice': getattr(fast_info, 'last_price', None),
+                    'marketCap': getattr(fast_info, 'market_cap', None),
+                    'shortName': ticker,
+                    'longName': ticker,
+                    'quoteType': 'EQUITY',
+                    'currency': getattr(fast_info, 'currency', 'USD'),
+                    'exchange': getattr(fast_info, 'exchange', 'NASDAQ')
+                }
+    except Exception:
+        pass
     
     return None
 
@@ -3274,23 +3293,26 @@ def fetch_multiple_stock_info_robust(tickers: List[str], max_workers: int = 3) -
     successful = sum(1 for v in results.values() if v is not None)
     if st.session_state.get('debug_mode', False):
         st.success(f"Successfully fetched data for {successful}/{total_tickers} tickers")
+        
+        # Show which tickers failed
+        failed_tickers = [ticker for ticker, result in results.items() if result is None]
+        if failed_tickers:
+            st.warning(f"Failed tickers: {', '.join(failed_tickers)}")
     
     return results
 
 # Fallback data handling
-def get_fallback_stock_data(ticker: str) -> Optional[Dict]:
+def get_fallback_stock_data(ticker: str) -> Dict:
     """Provide basic fallback data when all fetching methods fail"""
     # This could be expanded to use alternative data sources
     # For now, provide minimal structure to prevent complete failures
     return {
         'shortName': ticker,
-        'currentPrice': None,
-        'marketCap': None,
-        'trailingPE': None,
-        'beta': None,
-        'sector': 'Unknown',
-        'industry': 'Unknown',
-        'quoteType': 'EQUITY'
+        'longName': ticker,
+        'quoteType': 'EQUITY',
+        'currency': 'USD'
+        # Don't set other fields to None/Unknown - let them be missing
+        # so the UI can handle them appropriately
     }
 
 def validate_stock_data(data: Optional[Dict], ticker: str) -> Dict:
@@ -3298,21 +3320,169 @@ def validate_stock_data(data: Optional[Dict], ticker: str) -> Dict:
     if not data:
         return get_fallback_stock_data(ticker)
     
-    # Ensure required fields exist
-    required_fields = {
-        'shortName': ticker,
-        'currentPrice': None,
-        'marketCap': None,
-        'trailingPE': None,
-        'beta': None,
-        'sector': 'Unknown',
-        'industry': 'Unknown',
-        'quoteType': 'EQUITY'
+    # Create a copy to avoid modifying the original
+    validated_data = data.copy()
+    
+    # Handle price fields - try multiple possible keys
+    if not validated_data.get('currentPrice'):
+        for price_key in ['regularMarketPrice', 'previousClose', 'open']:
+            if validated_data.get(price_key):
+                validated_data['currentPrice'] = validated_data[price_key]
+                break
+    
+    # Handle name fields - try multiple possible keys
+    if not validated_data.get('shortName'):
+        for name_key in ['longName', 'displayName']:
+            if validated_data.get(name_key):
+                validated_data['shortName'] = validated_data[name_key]
+                break
+        if not validated_data.get('shortName'):
+            validated_data['shortName'] = ticker
+    
+    # Handle beta - try different keys
+    if not validated_data.get('beta'):
+        for beta_key in ['beta3Year', 'beta5Year']:
+            if validated_data.get(beta_key):
+                validated_data['beta'] = validated_data[beta_key]
+                break
+    
+    # Handle PE ratio - try different keys
+    if not validated_data.get('trailingPE'):
+        for pe_key in ['forwardPE', 'priceToEarningsTrailing12Months']:
+            if validated_data.get(pe_key):
+                validated_data['trailingPE'] = validated_data[pe_key]
+                break
+    
+    # Set minimal defaults only for truly missing critical fields
+    minimal_defaults = {
+        'quoteType': 'EQUITY',
+        'currency': 'USD'
     }
     
-    for field, default in required_fields.items():
-        if field not in data or data[field] is None or data[field] == '':
-            data[field] = default
+    for field, default in minimal_defaults.items():
+        if field not in validated_data or validated_data[field] is None:
+            validated_data[field] = default
+    
+    return validated_data
+
+@st.cache_data(ttl=86400, show_spinner=False)  # Cache for 24 hours
+def fetch_financial_statement_robust(
+    ticker: str,
+    statement_type: str,
+    period: str = "Annual",
+    max_retries: int = 3
+) -> Optional[pd.DataFrame]:
+    """Robust financial statement fetcher with multiple fallback strategies"""
+    if not YFINANCE_AVAILABLE:
+        return None
+    
+    # Strategy 1: Try without proxy first
+    for attempt in range(max_retries):
+        try:
+            yf.set_config(proxy=None)
+            ticker_obj = yf.Ticker(ticker)
+            time.sleep(0.1 * (attempt + 1))  # Progressive delay
+            
+            if statement_type == "balance":
+                data = ticker_obj.balance_sheet if period == "Annual" else ticker_obj.quarterly_balance_sheet
+            elif statement_type == "income":
+                data = ticker_obj.income_stmt if period == "Annual" else ticker_obj.quarterly_income_stmt
+            elif statement_type == "cashflow":
+                data = ticker_obj.cashflow if period == "Annual" else ticker_obj.quarterly_cashflow
+            else:
+                return None
+            
+            if data is not None and not data.empty and len(data.columns) > 0:
+                # Filter out columns with too many NaN values (more than 70%)
+                filtered_data = data.loc[:, data.isna().mean() < 0.7]
+                if not filtered_data.empty:
+                    return filtered_data
+                    
+        except Exception as e:
+            if st.session_state.get('debug_mode', False) and attempt == max_retries - 1:
+                st.warning(f"Financial statement fetch failed for {ticker} ({statement_type}): {str(e)[:100]}")
+            time.sleep(0.5 * (attempt + 1))
+    
+    # Strategy 2: Try with proxy if no-proxy failed
+    if PROXY_AVAILABLE:
+        for attempt in range(2):
+            try:
+                proxy = get_proxy_dict(probability=1.0)
+                if proxy:
+                    yf.set_config(proxy=proxy)
+                    ticker_obj = yf.Ticker(ticker)
+                    time.sleep(0.3)
+                    
+                    if statement_type == "balance":
+                        data = ticker_obj.balance_sheet if period == "Annual" else ticker_obj.quarterly_balance_sheet
+                    elif statement_type == "income":
+                        data = ticker_obj.income_stmt if period == "Annual" else ticker_obj.quarterly_income_stmt
+                    elif statement_type == "cashflow":
+                        data = ticker_obj.cashflow if period == "Annual" else ticker_obj.quarterly_cashflow
+                    else:
+                        return None
+                    
+                    if data is not None and not data.empty and len(data.columns) > 0:
+                        filtered_data = data.loc[:, data.isna().mean() < 0.7]
+                        if not filtered_data.empty:
+                            return filtered_data
+            except Exception:
+                time.sleep(1.0)
+    
+    return None
+
+def enrich_stock_data(data: Dict, ticker: str) -> Dict:
+    """Try to enrich stock data with additional information from various yfinance attributes"""
+    if not YFINANCE_AVAILABLE:
+        return data
+    
+    # Only try enrichment if we're missing critical data
+    missing_critical = not all([
+        data.get('sector'), 
+        data.get('industry'), 
+        data.get('currentPrice'),
+        data.get('beta')
+    ])
+    
+    if not missing_critical:
+        return data
+    
+    try:
+        yf.set_config(proxy=None)
+        ticker_obj = yf.Ticker(ticker)
+        time.sleep(0.1)  # Small delay
+        
+        # Try to get additional info from different yfinance attributes
+        try:
+            # Sometimes info fails but other attributes work
+            if hasattr(ticker_obj, 'info'):
+                additional_info = ticker_obj.info
+                if additional_info and isinstance(additional_info, dict) and len(additional_info) > 3:
+                    # Only update if we got meaningful data
+                    fields_to_update = [
+                        'sector', 'industry', 'beta', 'trailingPE', 'marketCap',
+                        'fullTimeEmployees', 'city', 'state', 'companyOfficers',
+                        'fiftyTwoWeekHigh', 'fiftyTwoWeekLow'
+                    ]
+                    
+                    for field in fields_to_update:
+                        if not data.get(field) and additional_info.get(field):
+                            data[field] = additional_info[field]
+        except Exception:
+            pass
+        
+        # Try to get current price from recent history if missing
+        if not data.get('currentPrice'):
+            try:
+                recent_hist = ticker_obj.history(period="1d", timeout=10)
+                if recent_hist is not None and not recent_hist.empty:
+                    data['currentPrice'] = recent_hist['Close'].iloc[-1]
+            except Exception:
+                pass
+                
+    except Exception:
+        if st.session_state.get('debug_mode', False):
+            st.warning(f"Enrichment failed for {ticker}")
     
     return data
 
