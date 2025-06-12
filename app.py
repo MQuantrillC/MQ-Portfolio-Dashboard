@@ -877,10 +877,14 @@ def display_optimal_portfolio(tickers: List[str]):
         if len(valid_tickers) < len(tickers):
             # Some tickers don't have data, filter weights accordingly
             valid_indices = [i for i, ticker in enumerate(tickers) if ticker in valid_tickers]
-            filtered_weights = weights[valid_indices] if weights is not None else None
-            # Renormalize weights to sum to 1
-            if filtered_weights is not None:
+            if weights is not None:
+                # Convert to numpy array if it isn't already
+                weights_array = np.array(weights) if not isinstance(weights, np.ndarray) else weights
+                filtered_weights = weights_array[valid_indices]
+                # Renormalize weights to sum to 1
                 filtered_weights = filtered_weights / filtered_weights.sum()
+            else:
+                filtered_weights = None
         else:
             filtered_weights = weights
         
