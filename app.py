@@ -1779,6 +1779,7 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
     with st.spinner("Loading benchmark comparison..."):
         # Fetch portfolio data
         portfolio_data = {}
+        valid_tickers = []
         for ticker in tickers:
             hist = fetch_stock_history(
                 ticker,
@@ -1787,14 +1788,29 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
             )
             if hist is not None and not hist.empty:
                 portfolio_data[ticker] = hist['Close']
+                valid_tickers.append(ticker)
         if not portfolio_data:
             st.error("Could not fetch portfolio data")
             return
         # Create portfolio value series
         portfolio_df = pd.DataFrame(portfolio_data)
+        
+        # Handle weights - ensure they match the valid tickers
         if weights is None:
-            weights = np.array([1/len(tickers)] * len(tickers))  # Equal weights if not provided
-        portfolio_value = portfolio_df.dot(weights)
+            # Equal weights for valid tickers only
+            portfolio_weights = np.array([1/len(valid_tickers)] * len(valid_tickers))
+        else:
+            # Filter weights to match only valid tickers
+            if len(valid_tickers) < len(tickers):
+                # Some tickers don't have data, filter weights accordingly
+                valid_indices = [i for i, ticker in enumerate(tickers) if ticker in valid_tickers]
+                portfolio_weights = np.array(weights)[valid_indices]
+                # Renormalize weights to sum to 1
+                portfolio_weights = portfolio_weights / portfolio_weights.sum()
+            else:
+                portfolio_weights = weights
+        
+        portfolio_value = portfolio_df.dot(portfolio_weights)
         # Fetch SPY data (fix: use .history() and check .empty on DataFrame)
         spy_ticker = yf.Ticker("SPY")
         spy_hist = spy_ticker.history(start=start_date, end=end_date)
