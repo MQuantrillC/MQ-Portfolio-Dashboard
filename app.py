@@ -1,204 +1,54 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from datetime import datetime, timedelta
 import plotly.graph_objs as go
-from datetime import datetime
-import kagglehub
-import requests
-import os
 import plotly.express as px
 from collections import Counter
 import traceback
 import concurrent.futures
 from functools import lru_cache
 from numbers import Number
-from scipy.optimize import minimize
-from typing import Tuple
-from bs4 import BeautifulSoup
-from fp.fp import FreeProxy
+from typing import Tuple, Dict, List, Optional, Union
+import random
+import matplotlib
+import plotly.colors
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-@st.cache_data(ttl=3600)
-def get_historical_closes(ticker):
-    """Get historical close prices for different time periods"""
-    try:
-        # Get current price
-        current_price = yf.Ticker(ticker).history(period="1d")["Close"].iloc[-1]
-        
-        # Get historical prices
-        five_d_ago = yf.Ticker(ticker).history(period="5d")["Close"].iloc[0]
-        one_m_ago = yf.Ticker(ticker).history(period="1mo")["Close"].iloc[0]
-        six_m_ago = yf.Ticker(ticker).history(period="6mo")["Close"].iloc[0]
-        
-        # For YTD, get first trading day of current year
-        today = datetime.now()
-        ytd_start = datetime(today.year, 1, 1).strftime('%Y-%m-%d')
-        ytd_price = yf.Ticker(ticker).history(start=ytd_start)["Close"].iloc[0]
-        
-        one_y_ago = yf.Ticker(ticker).history(period="1y")["Close"].iloc[0]
-        five_y_ago = yf.Ticker(ticker).history(period="5y")["Close"].iloc[0]
-        
-        return {
-            "Current": current_price,
-            "5D Ago": five_d_ago,
-            "1M Ago": one_m_ago,
-            "6M Ago": six_m_ago,
-            "YTD Start": ytd_price,
-            "1Y Ago": one_y_ago,
-            "5Y Ago": five_y_ago
-        }
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error getting historical prices for {ticker}: {str(e)}")
-        return None
+# Try to import optional dependencies with fallbacks
+try:
+    from scipy.optimize import minimize
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    st.warning("scipy not available - some optimization features will be disabled")
 
-def get_spy_status_icon_and_label(change_percent: float, timeframe: str) -> Tuple[str, str]:
-    """Determine the status icon and label for SPY based on performance and timeframe"""
-    # Define thresholds based on timeframe
-    thresholds = {
-        "5D": (1.5, -1.5),
-        "1M": (3.0, -3.0),
-        "1Y": (8.0, -8.0),
-        "5Y": (35.0, 5.0),
-        "10Y": (80.0, 10.0)
-    }
-    
-    up_thresh, down_thresh = thresholds.get(timeframe, (0, 0))
-    
-    if change_percent >= up_thresh:
-        return "🟢", "Bullish"
-    elif change_percent <= down_thresh:
-        return "🔴", "Bearish"
-    else:
-        return "🟡", "Neutral"
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    st.error("yfinance not available - please install with: pip install yfinance")
 
-# Add helper functions for adaptive metrics
-def get_metric_labels(period_label):
-    """Generate appropriate metric labels based on selected period"""
-    label_map = {
-        "1D": ("Daily Change %", "Daily Gains/Losses"),
-        "5D": ("5-Day Change %", "5-Day Gains/Losses"),
-        "1M": ("Monthly Change %", "Monthly Gains/Losses"),
-        "6M": ("6-Month Change %", "6-Month Gains/Losses"),
-        "YTD": ("YTD Change %", "YTD Gains/Losses"),
-        "1Y": ("Annual Change %", "Annual Gains/Losses"),
-        "5Y": ("5-Year Change %", "5-Year Gains/Losses"),
-        "10Y": ("10-Year Change %", "10-Year Gains/Losses"),
-        "MAX": ("All-Time Change %", "All-Time Gains/Losses")
-    }
-    return label_map.get(period_label, ("Change %", "Gains/Losses"))
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    WEB_SCRAPING_AVAILABLE = True
+except ImportError:
+    WEB_SCRAPING_AVAILABLE = False
+    st.warning("requests/BeautifulSoup not available - web scraping features disabled")
 
-def calculate_period_change(close_series, period_label):
-    """Calculate percentage and value change with robust period handling"""
-    # Validate input
-    if close_series is None or not isinstance(close_series, pd.Series):
-        return None, None
-        
-    # Ensure we have a datetime index
-    if not isinstance(close_series.index, pd.DatetimeIndex):
-        try:
-            close_series.index = pd.to_datetime(close_series.index)
-        except Exception:
-            return None, None
-    
-    # Clean and sort the data
-    clean_series = close_series.dropna().sort_index()
-    
-    # Check we have enough data
-    if len(clean_series) < 2:
-        return None, None
-    
-    try:
-        # Handle different period types
-        if period_label == "1D":
-            # For intraday data, ensure we have today's complete session
-            today = pd.Timestamp.now().normalize()
-            mask = (clean_series.index >= today)
-            clean_series = clean_series[mask]
-            
-            # Need at least 2 points to calculate change
-            if len(clean_series) < 2:
-                return None, None
-                
-            # Use first and last point of today's data
-            start_price = float(clean_series.iloc[0])
-            end_price = float(clean_series.iloc[-1])
-            
-        elif period_label == "5D":
-            # Get data from last 5 trading days
-            five_days_ago = pd.Timestamp.now() - pd.Timedelta(days=5)
-            mask = (clean_series.index >= five_days_ago)
-            clean_series = clean_series[mask]
-            
-            if len(clean_series) < 2:
-                return None, None
-                
-            start_price = float(clean_series.iloc[0])
-            end_price = float(clean_series.iloc[-1])
-            
-        else:
-            # For all other periods, use first and last available points
-            start_price = float(clean_series.iloc[0])
-            end_price = float(clean_series.iloc[-1])
-        
-        # Validate prices
-        if start_price <= 0 or end_price <= 0:
-            return None, None
-            
-        # Calculate changes
-        pct_change = ((end_price - start_price) / start_price) * 100
-        value_change = end_price - start_price
-        
-        return round(pct_change, 2), round(value_change, 2)
-        
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error in calculate_period_change for {period_label}: {str(e)}")
-            st.error(traceback.format_exc())
-        return None, None
+try:
+    from fp.fp import FreeProxy
+    PROXY_AVAILABLE = True
+except ImportError:
+    PROXY_AVAILABLE = False
+    # Don't show warning for proxy as it's optional
 
-@st.cache_data(ttl=3600)
-def calculate_cached_period_change(ticker, period, interval):
-    """Cached version of period change calculation with improved error handling"""
-    try:
-        # Get the period label from the period_options mapping
-        period_label = next((k for k, v in period_options.items() if v[0] == period), None)
-        if period_label is None:
-            if st.session_state.get('debug_mode', False):
-                st.error(f"Invalid period: {period}")
-            return None, None
-
-        # For intraday periods, ensure we get enough data
-        if period_label in ["1D", "5D"]:
-            # Add extra buffer for intraday data to ensure we have enough points
-            if period_label == "1D":
-                period = "2d"  # Get 2 days of data to ensure we have enough points
-            else:  # 5D
-                period = "6d"  # Get 6 days of data to ensure we have enough points
-
-        # Download data with progress=False to avoid UI clutter
-        data = yf.download(ticker, period=period, interval=interval, progress=False)
-        
-        if data.empty or 'Close' not in data.columns:
-            if st.session_state.get('debug_mode', False):
-                st.error(f"No data returned for {ticker}")
-            return None, None
-
-        # Get close prices and ensure we have a Series
-        close_series = data['Close'] if isinstance(data['Close'], pd.Series) else data['Close'].iloc[:, 0]
-        
-        # Calculate changes using the improved function
-        return calculate_period_change(close_series, period_label)
-        
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error in calculate_cached_period_change: {str(e)}")
-            st.error(traceback.format_exc())
-        return None, None
-
-# Set page to wide layout
+# Set page config
 st.set_page_config(
-    page_title="Portfolio Dashboard",
+    page_title=" Optimal Portfolio Dashboard",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -218,23 +68,25 @@ if 'show_market_overview' not in st.session_state:
     st.session_state['show_market_overview'] = False
 if 'custom_weight_inputs' not in st.session_state:
     st.session_state['custom_weight_inputs'] = {}
+if 'debug_mode' not in st.session_state:
+    st.session_state['debug_mode'] = False
+if 'selected_timeframe' not in st.session_state:
+    st.session_state['selected_timeframe'] = '1M'
+if 'risk_level' not in st.session_state:
+    st.session_state['risk_level'] = 'Moderate'
 
-# Show initial message if portfolio not created
-if not st.session_state.get('portfolio_created'):
-    st.info("Enter tickers and click Apply to view your portfolio dashboard.")
-
-# Custom CSS for full width and better spacing
+# Custom CSS
 st.markdown("""
 <style>
     /* Main container adjustments */
     .block-container {
         padding-top: 1rem;
-        padding-bottom: 5rem !important;  /* Increased bottom padding */
+        padding-bottom: 5rem !important;
         padding-left: 2rem;
         padding-right: 2rem;
     }
     
-    /* Add metric explanation styling */
+    /* Metric explanation styling */
     .metric-explanation {
         font-size: 0.8rem;
         color: rgba(255, 255, 255, 0.8);
@@ -250,937 +102,574 @@ st.markdown("""
         width: 100%;
     }
     
-    /* Section padding */
-    section.main > div {
-        padding-left: 5%;
-        padding-right: 5%;
-    }
-    
-    /* Improve spacing between elements */
-    .stMarkdown {
-        margin-bottom: 0.5rem;
-    }
-    
-    /* Better table formatting */
-    .stDataFrame {
-        font-size: 0.9rem;
-    }
-    
-    /* Enhanced metric cards styling */
-    div[data-testid="stMetric"] {
-        background-color: #1f77b4;
-        border-radius: 0.5rem;
-        padding: 1.5rem;
-        color: white;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        transition: transform 0.2s ease-in-out;
-        margin-bottom: 1.5rem;
-    }
-    
-    div[data-testid="stMetric"]:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-    }
-    
-    div[data-testid="stMetric"] > div > div {
-        color: white !important;
-    }
-    
-    div[data-testid="stMetric"] > div > div[data-testid="stMetricValue"] {
-        font-size: 1.5rem !important;
-        font-weight: bold !important;
-    }
-    
-    div[data-testid="stMetric"] > div > div[data-testid="stMetricLabel"] {
-        font-size: 1rem !important;
-        opacity: 0.9;
-    }
-    
-    /* Consistent chart heights */
-    .stPlotlyChart {
-        height: 400px;
-    }
-    
-    /* Better form spacing */
-    .stForm {
-        padding: 1rem;
-        border: 1px solid #e0e0e0;
-        border-radius: 0.5rem;
-        margin-bottom: 1rem;
-    }
-    
-    /* Improve selectbox and multiselect */
-    .stSelectbox, .stMultiSelect {
-        margin-bottom: 0.5rem;
-    }
-    
-    /* Better tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2rem;
-    }
-    
-    /* Consistent spacing for columns */
-    .row-widget.stHorizontal {
-        gap: 1rem;
-    }
-    
-    /* Add spacing after sections */
-    .stMarkdown h3 {
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-        padding-bottom: 0.5rem;
-        border-bottom: 2px solid #f0f2f6;
-    }
-    
-    /* Improve section headers */
-    .stMarkdown h2 {
-        margin-top: 2.5rem;
-        margin-bottom: 1.5rem;
-        color: #1f77b4;
-        font-weight: 600;
-    }
-    
-    /* Add subtle background to sections */
-    .stMarkdown h2 + div {
-        background-color: #f8f9fa;
-        padding: 1.5rem;
-        border-radius: 0.5rem;
-        margin-bottom: 2rem;
-    }
-    
-    /* Improve spacing between metrics and charts */
-    div[data-testid="stMetric"] + div {
-        margin-top: 2rem;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Initialize session state first, before any other code
-if 'ticker_info_cache' not in st.session_state:
-    st.session_state['ticker_info_cache'] = {}
-if 'kaggle_path' not in st.session_state:
-    st.session_state['kaggle_path'] = None
-if 'optimal_result' not in st.session_state:
-    st.session_state['optimal_result'] = None
-if 'optimal_metrics' not in st.session_state:
-    st.session_state['optimal_metrics'] = None
-if 'optimal_backtest' not in st.session_state:
-    st.session_state['optimal_backtest'] = None
-if 'optimal_table' not in st.session_state:
-    st.session_state['optimal_table'] = None
-if 'sector_map' not in st.session_state:
-    st.session_state['sector_map'] = None
-if 'missing_tickers' not in st.session_state:
-    st.session_state['missing_tickers'] = None
-if 'selected_tickers' not in st.session_state:
-    st.session_state['selected_tickers'] = None
-if 'risk_level' not in st.session_state:
-    st.session_state['risk_level'] = None
-if 'close_prices' not in st.session_state:
-    st.session_state['close_prices'] = None
-if 'portfolio_weights' not in st.session_state:
-    st.session_state['portfolio_weights'] = None
-if 'ef_portfolios' not in st.session_state:
-    st.session_state['ef_portfolios'] = None
-
-
-
-@st.cache_data(ttl=86400)  # Cache for 24 hours
-def get_sp500_tickers():
-    """
-    Fetch S&P 500 tickers using multiple reliable methods with proxy support
-    Returns sorted list of tickers or fallback list if all methods fail
-    """
-    # Method 1: Wikipedia (most reliable)
-    try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        
-        # Try with proxy first
-        try:
-            proxy = FreeProxy(rand=True).get()
-            proxies = {"http": proxy, "https": proxy}
-            response = requests.get(url, headers=headers, proxies=proxies, timeout=10)
-        except:
-            response = requests.get(url, headers=headers, timeout=10)
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Find the correct table - more robust selection
-        table = soup.find('table', {'id': 'constituents'})
-        if not table:
-            tables = soup.find_all('table')
-            table = next((t for t in tables if len(t.find_all('tr')) > 400), None)
-        
-        if table:
-            symbols = []
-            rows = table.find_all('tr')[1:]  # Skip header
-            for row in rows:
-                cells = row.find_all('td')
-                if len(cells) > 0:
-                    symbol = cells[0].text.strip()
-                    # Handle cases like BRK.B -> BRK-B
-                    symbol = symbol.replace('.', '-')
-                    if symbol and len(symbol) <= 10:  # Basic validation
-                        symbols.append(symbol)
-            
-            if len(symbols) > 400:  # Sanity check
-                return sorted(symbols)
-                
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Wikipedia method failed: {str(e)}")
-
-    # Method 2: StockAnalysis.com (alternative source)
-    try:
-        url = "https://stockanalysis.com/list/sp-500-stocks/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        
-        # Try with proxy first
-        try:
-            proxy = FreeProxy(rand=True).get()
-            proxies = {"http": proxy, "https": proxy}
-            response = requests.get(url, headers=headers, proxies=proxies, timeout=10)
-        except:
-            response = requests.get(url, headers=headers, timeout=10)
-        
-        # Use pandas to parse the table
-        tables = pd.read_html(response.text)
-        for table in tables:
-            if 'Symbol' in table.columns:
-                symbols = table['Symbol'].dropna().astype(str).tolist()
-                symbols = [s.replace('.', '-').strip() for s in symbols if s and len(s) <= 10]
-                if len(symbols) > 400:
-                    return sorted(symbols)
-                    
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"StockAnalysis method failed: {str(e)}")
-
-    # Method 3: NASDAQ API (official source)
-    try:
-        url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=500&exchange=nasdaq&exchange=nyse&exchange=amex"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/json"
-        }
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        data = response.json()
-        
-        if data and 'data' in data and 'rows' in data['data']:
-            symbols = [row['symbol'] for row in data['data']['rows'] 
-                      if row['marketCap'] and float(row['marketCap']) >= 10_000_000_000]  # Filter for large caps
-            symbols = [s.replace('.', '-').strip() for s in symbols if s and len(s) <= 10]
-            if len(symbols) > 400:
-                return sorted(symbols)
-                
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"NASDAQ API method failed: {str(e)}")
-
-    # Last resort: Hardcoded list of top 50 S&P 500 stocks
-    fallback = [
-        "AAPL", "MSFT", "AMZN", "GOOG", "GOOGL", "META", "TSLA", "NVDA", "BRK-B", "JPM", 
-        "V", "JNJ", "WMT", "PG", "MA", "UNH", "HD", "DIS", "BAC", "PYPL", 
-        "VZ", "CMCSA", "ADBE", "NFLX", "CRM", "PEP", "KO", "T", "ABT", "INTC", 
-        "ORCL", "CSCO", "AVGO", "QCOM", "TXN", "NKE", "MRK", "PFE", "WFC", "UPS", 
-        "MS", "RTX", "IBM", "MMM", "GE", "F", "GM", "TGT", "LOW", "COST"
-    ]
-    
-    st.warning("Could not fetch S&P 500 tickers from any source. Using fallback list.")
-    return sorted(fallback)
-
-@st.cache_data(ttl=3600)  # 1 hour for market data
-def get_top_movers(timeframe="1d"):
-    """Fetch top gainers/losers from S&P 500 for a timeframe."""
-    with st.spinner("Fetching market data. This may take 10-15 seconds..."):
-        # Get S&P 500 tickers
-        try:
-            sp500_tickers = get_sp500_tickers()
-            if not sp500_tickers:
-                st.warning("Could not fetch S&P 500 tickers")
-                return [], []
-        except Exception as e:
-            st.warning(f"Error getting S&P 500 tickers: {str(e)}")
-            return [], []
-        
-        # Limit to top 100 tickers for better performance
-        sp500_tickers = sp500_tickers[:100]
-        
-        # Adjust intervals for better performance
-        timeframe_map = {
-            "1D": ("1d", "15m"),
-            "1W": ("5d", "1h"),
-            "1M": ("1mo", "1d"),
-            "3M": ("3mo", "1d"),
-            "YTD": ("ytd", "1d"),
-            "1Y": ("1y", "1wk"),
-            "5Y": ("5y", "1mo"),
-            "10Y": ("10y", "1mo")
-        }
-        
-        if timeframe in timeframe_map:
-            period, interval = timeframe_map[timeframe]
-        else:
-            period, interval = "1mo", "1d"
-            
-        try:
-            # Download data with MultiIndex structure and threading enabled
-            data = yf.download(
-                sp500_tickers, 
-                period=period, 
-                interval=interval, 
-                group_by="ticker", 
-                progress=False, 
-                threads=True
-            )
-            
-            returns = {}
-            failed_tickers = []
-            
-            for ticker in sp500_tickers:
-                try:
-                    # Handle both MultiIndex and flat index structures
-                    if isinstance(data.columns, pd.MultiIndex):
-                        if ('Close', ticker) in data.columns:
-                            close = data['Close'][ticker]
-                        else:
-                            continue
-                    else:
-                        if ticker in data.columns:
-                            close = data[ticker]
-                        else:
-                            continue
-                    
-                    # Fill missing values and ensure we have enough data
-                    close = close.ffill().bfill()
-                    if len(close) > 1:
-                        start_price = close.iloc[0]
-                        end_price = close.iloc[-1]
-                        if start_price > 0 and end_price > 0:  # Additional validation
-                            returns[ticker] = (end_price - start_price) / start_price * 100
-                except Exception as e:
-                    failed_tickers.append(ticker)
-                    continue
-                    
-            if failed_tickers:
-                st.warning(f"Could not fetch data for {len(failed_tickers)} tickers")
-                
-            if not returns:
-                st.warning("No valid return data found for selected timeframe.")
-                return [], []
-                
-            sorted_returns = sorted(returns.items(), key=lambda x: x[1], reverse=True)
-            return sorted_returns[:10], sorted_returns[-10:][::-1]
-            
-        except Exception as e:
-            st.error(f"Error downloading market data: {str(e)}")
-            return [], []
-
-@st.cache_data(ttl=3600)  # 1 hour for sector performance
-def get_sector_performance_custom(timeframe="1mo"):
-    """Fetch sector performance using sector ETFs with custom timeframe support."""
-    sectors = {
-        'Technology': 'XLK',
-        'Healthcare': 'XLV',
-        'Financials': 'XLF',
-        'Consumer Discretionary': 'XLY',
-        'Industrials': 'XLI',
-        'Energy': 'XLE',
-        'Consumer Staples': 'XLP',
-        'Utilities': 'XLU',
-        'Materials': 'XLB',
-        'Real Estate': 'XLRE',
-        'Communication Services': 'XLC'
-    }
-
-    # Map custom timeframes to yfinance parameters
-    timeframe_map = {
-        "This Week": ("5d", "1d"),
-        "This Month": ("1mo", "1d"),
-        "This Year": ("1y", "1wk"),
-        "YTD": ("ytd", "1d"),
-        "5Y": ("5y", "1mo"),
-        "10Y": ("10y", "1mo")
-    }
-    
-    if timeframe not in timeframe_map:
-        period, interval = "1mo", "1d"
-    else:
-        period, interval = timeframe_map[timeframe]
-
-    try:
-        # Download data for each sector ETF individually
-        sector_perf = []
-        for name, symbol in sectors.items():
-            try:
-                # Download data for this ETF
-                data = yf.download(
-                    symbol,
-                    period=period,
-                    interval=interval,
-                    progress=False
-                )
-                
-                if data.empty:
-                    st.warning(f"No data returned for {name} ({symbol})")
-                    continue
-                
-                # Get close prices - ensure we get a Series, not a DataFrame
-                close_prices = data['Close'].dropna() if 'Close' in data.columns else None
-                
-                if close_prices is None or len(close_prices) < 2:
-                    st.warning(f"Insufficient data points for {name} ({symbol})")
-                    continue
-                
-                # Convert to numpy array if needed to avoid Series comparison issues
-                close_values = close_prices.values if hasattr(close_prices, 'values') else close_prices
-                
-                # Calculate performance - ensure we're working with scalar values
-                start_price = float(close_values[0])
-                end_price = float(close_values[-1])
-                
-                # Validate prices
-                if start_price <= 0 or end_price <= 0:
-                    st.warning(f"Invalid prices for {name} ({symbol}): start={start_price}, end={end_price}")
-                    continue
-                
-                perf = (end_price - start_price) / start_price * 100
-                
-                # Validate performance calculation
-                if not isinstance(perf, Number) or np.isnan(perf) or np.isinf(perf):
-                    st.warning(f"Invalid performance calculation for {name} ({symbol}): {perf}")
-                    continue
-                
-                sector_perf.append((name, float(perf)))
-                
-            except Exception as e:
-                st.warning(f"Error processing {name} ({symbol}): {str(e)}")
-                continue
-        
-        if not sector_perf:
-            st.warning("No valid sector performance data could be calculated")
-            return []
-            
-        # Sort by performance (highest first)
-        return sorted(sector_perf, key=lambda x: x[1], reverse=True)
-        
-    except Exception as e:
-        st.error(f"Error fetching sector performance: {str(e)}")
-        if st.session_state.get('debug_mode', False):
-            st.error(traceback.format_exc())
-        return []
-
-# --- Key Financial Ratios Helper Functions ---
-def horizontal_analysis(prev_value, current_value):
-    """Calculate percentage change between two values (horizontal analysis)"""
-    if prev_value is None or current_value is None or prev_value == 0:
-        return None
-    return ((current_value - prev_value) / prev_value) * 100
-
-def current_ratio(current_assets, current_liabilities):
-    return current_assets / current_liabilities if current_liabilities else None
-
-def quick_ratio(current_assets, inventory, current_liabilities):
-    return (current_assets - inventory) / current_liabilities if current_liabilities else None
-
-def working_capital(current_assets, current_liabilities):
-    return current_assets - current_liabilities if current_assets is not None and current_liabilities is not None else None
-
-def gross_margin(gross_profit, revenue):
-    return gross_profit / revenue if revenue else None
-
-def operating_margin(operating_income, revenue):
-    return operating_income / revenue if revenue else None
-
-def net_margin(net_income, revenue):
-    return net_income / revenue if revenue else None
-
-def return_on_assets(net_income, total_assets):
-    return net_income / total_assets if total_assets else None
-
-def return_on_equity(net_income, equity):
-    return net_income / equity if equity else None
-
-def dso(avg_receivables, revenue):
-    return (avg_receivables / revenue) * 365 if avg_receivables is not None and revenue else None
-
-def dpo(avg_payables, purchases):
-    return (avg_payables / purchases) * 360 if avg_payables is not None and purchases else None
-
-def dio(avg_inventory, cogs):
-    return (avg_inventory / cogs) * 365 if avg_inventory is not None and cogs else None
-
-def cash_conversion_cycle(dso_val, dio_val, dpo_val):
-    if dso_val is not None and dio_val is not None and dpo_val is not None:
-        return dso_val + dio_val - dpo_val
-    return None
-
-def interpret_ratios(ratios):
-    insights = []
-
-    def fmt(val, percent=False):
-        try:
-            if val is None:
-                return "N/A"
-            if percent:
-                return f"{val:.2%}"
-            else:
-                return f"{val:,.2f}"
-        except:
-            return "N/A"
-
-    # --- Liquidity ---
-    cr = ratios.get("Current Ratio")
-    if isinstance(cr, (int, float)):
-        if cr < 1:
-            insights.append(f"🔴 **Current Ratio < 1** — may struggle to meet obligations. ({fmt(cr)})")
-        elif cr > 3:
-            insights.append(f"🟡 **Current Ratio > 3** — may suggest excess idle assets. ({fmt(cr)})")
-        else:
-            insights.append(f"🟢 **Current Ratio** is healthy. ({fmt(cr)})")
-
-    qr = ratios.get("Quick Ratio")
-    if isinstance(qr, (int, float)):
-        if qr < 1:
-            insights.append(f"🔴 **Quick Ratio < 1** — liquidity concern without inventory. ({fmt(qr)})")
-        elif qr < 2:
-            insights.append(f"🟡 **Quick Ratio** between 1–2 — moderate liquidity. ({fmt(qr)})")
-        else:
-            insights.append(f"🟢 **Quick Ratio** is strong. ({fmt(qr)})")
-
-    wc = ratios.get("Working Capital")
-    if isinstance(wc, (int, float)):
-        if wc < 0:
-            insights.append(f"🔴 **Negative Working Capital** — liquidity risk. ({fmt(wc)})")
-        else:
-            insights.append(f"🟢 **Working Capital** is positive — short-term solvency is fine. ({fmt(wc)})")
-
-    # --- Profitability ---
-    gm = ratios.get("Gross Margin")
-    if isinstance(gm, (int, float)):
-        if gm < 0.2:
-            insights.append(f"🔴 **Low Gross Margin** — high production costs. ({fmt(gm, True)})")
-        elif gm < 0.4:
-            insights.append(f"🟡 **Gross Margin** is moderate — average cost control. ({fmt(gm, True)})")
-        else:
-            insights.append(f"🟢 **Gross Margin** is strong — efficient cost structure. ({fmt(gm, True)})")
-
-    om = ratios.get("Operating Margin")
-    if isinstance(om, (int, float)):
-        if om < 0.1:
-            insights.append(f"🔴 **Low Operating Margin** — heavy operating costs. ({fmt(om, True)})")
-        elif om < 0.2:
-            insights.append(f"🟡 **Operating Margin** is moderate — room for efficiency. ({fmt(om, True)})")
-        else:
-            insights.append(f"🟢 **Operating Margin** is healthy. ({fmt(om, True)})")
-
-    nm = ratios.get("Net Margin")
-    if isinstance(nm, (int, float)):
-        if nm < 0:
-            insights.append(f"🔴 **Negative Net Margin** — company is unprofitable. ({fmt(nm, True)})")
-        elif nm > 0.20:
-            insights.append(f"🟢 **Net Margin** is excellent — highly profitable. ({fmt(nm, True)})")
-        else:
-            insights.append(f"🟡 **Net Margin** is moderate. ({fmt(nm, True)})")
-
-    roa = ratios.get("ROA")
-    if isinstance(roa, (int, float)):
-        if roa < 0:
-            insights.append(f"🔴 **Negative ROA** — inefficient asset use. ({fmt(roa, True)})")
-        elif roa > 0.1:
-            insights.append(f"🟢 **ROA** is strong — assets generate solid returns. ({fmt(roa, True)})")
-        else:
-            insights.append(f"🟡 **ROA** is average. ({fmt(roa, True)})")
-
-    roe = ratios.get("ROE")
-    if isinstance(roe, (int, float)):
-        if roe < 0:
-            insights.append(f"🔴 **Negative ROE** — equity is being eroded. ({fmt(roe, True)})")
-        elif roe > 0.15:
-            insights.append(f"🟢 **ROE** is high — strong returns to shareholders. ({fmt(roe, True)})")
-        else:
-            insights.append(f"🟡 **ROE** is average. ({fmt(roe, True)})")
-
-    # --- Efficiency ---
-    dso = ratios.get("DSO")
-    if isinstance(dso, (int, float)):
-        if dso > 60:
-            insights.append(f"🔴 **High DSO** — slow collection from customers. ({fmt(dso)})")
-        elif dso < 30:
-            insights.append(f"🟢 **Low DSO** — fast payment cycle. ({fmt(dso)})")
-        else:
-            insights.append(f"🟡 **DSO** is average. ({fmt(dso)})")
-
-    dpo = ratios.get("DPO")
-    if isinstance(dpo, (int, float)):
-        if dpo > 90:
-            insights.append(f"🟢 **High DPO** — good supplier credit use. ({fmt(dpo)})")
-        elif dpo < 30:
-            insights.append(f"🔴 **Low DPO** — short supplier payment terms. ({fmt(dpo)})")
-        else:
-            insights.append(f"🟡 **DPO** is within normal range. ({fmt(dpo)})")
-
-    dio = ratios.get("DIO")
-    if isinstance(dio, (int, float)):
-        if dio > 90:
-            insights.append(f"🔴 **High DIO** — slow inventory turnover. ({fmt(dio)})")
-        elif dio < 30:
-            insights.append(f"🟢 **Low DIO** — inventory moves fast. ({fmt(dio)})")
-        else:
-            insights.append(f"🟡 **DIO** is average. ({fmt(dio)})")
-
-    ccc = ratios.get("Cash Conversion Cycle")
-    if isinstance(ccc, (int, float)):
-        if ccc < 0:
-            insights.append(f"🟢 **Negative CCC** — efficient cash cycle. ({fmt(ccc)})")
-        elif ccc < 60:
-            insights.append(f"🟡 **CCC** is reasonable. ({fmt(ccc)})")
-        else:
-            insights.append(f"🔴 **High CCC** — slow liquidity conversion. ({fmt(ccc)})")
-
-    return insights
-
-@st.cache_data(ttl=3600)  # 1 hour for asset price changes
-def get_asset_price_change(symbol: str, period: str = "1mo"):
-    import yfinance as yf
-    import numpy as np
-
-    try:
-        data = yf.download(symbol, period=period, progress=False)
-        if data.empty or "Close" not in data.columns:
-            return None
-
-        close_prices = data["Close"].dropna()
-        if len(close_prices) < 2:
-            return None
-
-        current_price = close_prices.iloc[-1]
-        old_price = close_prices.iloc[0]
-        pct_change = ((current_price - old_price) / old_price) * 100
-
-        return {
-            "symbol": symbol,
-            "current_price": current_price,
-            "pct_change": pct_change
-        }
-    except Exception as e:
-        print(f"Error loading {symbol}: {e}")
-        return None
-
-# Monte Carlo Simulation Helper
-def monte_carlo_simulation(start_value, mean_return, volatility, years=10, simulations=500, steps_per_year=252):
-    dt = 1 / steps_per_year
-    total_steps = int(steps_per_year * years)
-    results = np.zeros((simulations, total_steps))
-    for i in range(simulations):
-        prices = [start_value]
-        for _ in range(total_steps - 1):
-            shock = np.random.normal(loc=(mean_return - 0.5 * volatility**2) * dt, scale=volatility * np.sqrt(dt))
-            prices.append(prices[-1] * np.exp(shock))
-        results[i] = prices
-    return results
-
-def calculate_annual_returns(close_prices, weights):
-    """Calculate annual returns for the portfolio"""
-    # Resample to yearly closing prices
-    yearly_prices = close_prices.resample('Y').last()
-    # Calculate yearly returns
-    yearly_returns = yearly_prices.pct_change().dropna()
-    # Calculate weighted portfolio returns
-    port_returns = (yearly_returns * weights).sum(axis=1)
-    return port_returns
-
-# Inject tooltip CSS at the very top, only once
-if 'custom_tooltip_css' not in st.session_state:
-    st.markdown(
-        """
-        <style>
-        .tooltip {
-            position: relative;
-            display: inline-block;
-            cursor: help;
-        }
-        .tooltip .tooltiptext {
-            visibility: hidden;
-            width: 260px;
-            background-color: #222;
-            color: #fff;
-            text-align: left;
-            border-radius: 6px;
-            padding: 8px 10px;
-            position: absolute;
-            z-index: 1;
-            bottom: 125%;
-            left: 50%;
-            margin-left: -130px;
-            opacity: 0;
-            transition: opacity 0.3s;
-            font-size: 0.9em;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-        }
-        .tooltip:hover .tooltiptext {
-            visibility: visible;
-            opacity: 1;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-    st.session_state['custom_tooltip_css'] = True
-
-# Sidebar
-# st.sidebar.title("Portfolio Options")
-
-# Load Kaggle CSV for sector/industry fallback and sector allocation (make available globally)
-try:
-    kaggle_csv_path = os.path.join(kagglehub.dataset_download("andrewmvd/sp-500-stocks"), "sp500_stocks.csv")
-    kaggle_df = pd.read_csv(kaggle_csv_path)
-except Exception:
-    kaggle_df = None
-
-# Global constants
-BLUE_PALETTE = ['#1f77b4', '#2ca9e1', '#4dabf7', '#74c0fc', '#90d8fd', '#a5d8ff', '#c4e0ff', '#d6e9ff']
-
-# Initialize ticker info cache in session state
-if 'ticker_info_cache' not in st.session_state:
-    st.session_state['ticker_info_cache'] = {}
-
-# Initialize financial data cache
-if 'financial_data_cache' not in st.session_state:
-    st.session_state['financial_data_cache'] = {}
-
-# Persist weights across reruns
-if 'custom_weight_inputs' not in st.session_state:
-    st.session_state['custom_weight_inputs'] = {}
-
-def get_info(ticker):
-    """Get ticker info with caching"""
-    # Ensure cache exists
-    if 'ticker_info_cache' not in st.session_state:
-        st.session_state['ticker_info_cache'] = {}
-    
-    cache = st.session_state['ticker_info_cache']
-    
-    if ticker not in cache:
-        try:
-            with st.spinner(f"Fetching data for {ticker}..."):
-                cache[ticker] = yf.Ticker(to_yahoo_ticker(ticker)).info or {}
-        except Exception as e:
-            st.error(f"Error fetching data for {ticker}: {str(e)}")
-            cache[ticker] = {}
-    
-    return cache[ticker]
-
-def fetch_ticker_info_parallel(tickers):
-    """Fetch ticker info in parallel using ThreadPoolExecutor"""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(tickers))) as executor:
-        future_to_ticker = {executor.submit(get_info, ticker): ticker for ticker in tickers}
-        for future in concurrent.futures.as_completed(future_to_ticker):
-            ticker = future_to_ticker[future]
-            try:
-                future.result()  # This will raise any exceptions that occurred
-            except Exception as e:
-                st.warning(f"Error fetching data for {ticker}: {str(e)}")
-
-@lru_cache(maxsize=100)
-def get_financial_data(ticker, statement_type):
-    """Get financial data with caching"""
-    cache_key = f"{ticker}_{statement_type}"
-    if cache_key not in st.session_state['financial_data_cache']:
-        try:
-            ticker_obj = yf.Ticker(ticker)
-            if statement_type == 'income':
-                data = ticker_obj.income_stmt
-            elif statement_type == 'balance':
-                data = ticker_obj.balance_sheet
-            elif statement_type == 'cashflow':
-                data = ticker_obj.cashflow
-            else:
-                return None
-            st.session_state['financial_data_cache'][cache_key] = data
-        except Exception:
-            st.session_state['financial_data_cache'][cache_key] = None
-    return st.session_state['financial_data_cache'][cache_key]
-
-# Helper functions at the top
-@st.cache_data(ttl=86400)  # 24 hours for financial data
-def get_sector_allocation_from_yfinance(tickers):
-    sector_map = {}
-    missing_tickers = []
-    for ticker in tickers:
-        try:
-            info = yf.Ticker(ticker).info
-            sector = info.get("sector", None)
-            if sector:
-                sector_map[ticker] = sector
-            else:
-                missing_tickers.append(ticker)
-        except Exception:
-            missing_tickers.append(ticker)
-    return sector_map, missing_tickers
-
-def to_yahoo_ticker(ticker):
-    return ticker.replace('.', '-')
-
-def format_market_cap(val):
-    try:
-        val = float(val)
-        if val >= 1e12:
-            return f"${val/1e12:.2f}T"
-        elif val >= 1e9:
-            return f"${val/1e9:.2f}B"
-        elif val >= 1e6:
-            return f"${val/1e6:.2f}M"
-        elif val >= 1e3:
-            return f"${val/1e3:.2f}K"
-        else:
-            return f"${val:,.0f}"
-    except Exception:
-        return 'N/A'
-
-# Cache and reuse all_tickers
-all_tickers = get_sp500_tickers()
-
-# Period selector (now above charts, not in sidebar)
-period_options = {
-    "1D": ("1d", "15m"),  # Changed interval from 5m to 15m for 1D
-    "5D": ("5d", "5m"),   # Changed interval from 15m to 5m for 5D
-    "1M": ("1mo", "30m"),
-    "6M": ("6mo", "1d"),
-    "YTD": ("ytd", "1d"),
-    "1Y": ("1y", "1d"),
-    "5Y": ("5y", "1wk"),
-    "10Y": ("10y", "1mo"),
-    "MAX": ("max", "1mo")
-}
-
-st.title("Portfolio Dashboard")
-
-# --- UI Reorganization ---
-# 1. Stock Tickers and Risk Level at the top
-st.markdown("## Create Optimal Portfolio")
-
-# Tooltip CSS (keep this at the top or before usage)
-st.markdown("""
-<style>
-    .custom-tooltip {
+    /* Tooltip styling */
+    .tooltip {
+        position: relative;
         display: inline-block;
-        margin-left: 5px;
-        color: #1f77b4;
-        cursor: help;
     }
-    .custom-tooltip .tooltiptext {
+    .tooltip .tooltiptext {
         visibility: hidden;
-        width: 300px;
-        background-color: #333;
-        color: white;
-        text-align: left;
+        width: 200px;
+        background-color: #555;
+        color: #fff;
+        text-align: center;
         border-radius: 6px;
-        padding: 10px;
+        padding: 5px;
         position: absolute;
         z-index: 1;
-        transform: translateX(-50%);
+        bottom: 125%;
+        left: 50%;
+        margin-left: -100px;
         opacity: 0;
         transition: opacity 0.3s;
-        font-size: 0.9em;
     }
-    .custom-tooltip:hover .tooltiptext {
+    .tooltip:hover .tooltiptext {
         visibility: visible;
         opacity: 1;
     }
+    .company-info-metrics .element-container {font-size: 0.92em !important;}
 </style>
 """, unsafe_allow_html=True)
 
-risk_level = st.radio(
-    "Select Risk Level", 
-    ["Low", "Moderate", "High", "Custom"], 
-    horizontal=True,
-    help="Choose how aggressively your portfolio should be optimized."
-)
-
-# Risk descriptions with inline tooltip icon
-risk_descriptions = {
-    "Low": "<strong>Low</strong>: Prioritizes capital preservation with minimal volatility. <span class='custom-tooltip'>ℹ️<span class='tooltiptext'><strong>Low</strong>: Minimizes volatility (reduces risk). Best for conservative investors.<br><br><strong>Moderate</strong>: Balances risk/return (maximizes Sharpe Ratio).<br><br><strong>High</strong>: Maximizes returns (ignores volatility).<br><br><strong>Custom</strong>: Set your own weights manually.</span></span>",
-    "Moderate": "<strong>Moderate</strong>: Balances risk and return for optimal growth. <span class='custom-tooltip'>ℹ️<span class='tooltiptext'><strong>Low</strong>: Minimizes volatility (reduces risk). Best for conservative investors.<br><br><strong>Moderate</strong>: Balances risk/return (maximizes Sharpe Ratio).<br><br><strong>High</strong>: Maximizes returns (ignores volatility).<br><br><strong>Custom</strong>: Set your own weights manually.</span></span>",
-    "High": "<strong>High</strong>: Targets maximum returns (highest volatility). <span class='custom-tooltip'>ℹ️<span class='tooltiptext'><strong>Low</strong>: Minimizes volatility (reduces risk). Best for conservative investors.<br><br><strong>Moderate</strong>: Balances risk/return (maximizes Sharpe Ratio).<br><br><strong>High</strong>: Maximizes returns (ignores volatility).<br><br><strong>Custom</strong>: Set your own weights manually.</span></span>",
-    "Custom": "<strong>Custom</strong>: Manually allocate weights to each asset. <span class='custom-tooltip'>ℹ️<span class='tooltiptext'><strong>Low</strong>: Minimizes volatility (reduces risk). Best for conservative investors.<br><br><strong>Moderate</strong>: Balances risk/return (maximizes Sharpe Ratio).<br><br><strong>High</strong>: Maximizes returns (ignores volatility).<br><br><strong>Custom</strong>: Set your own weights manually.</span></span>"
+# Add custom CSS for enhanced styling
+st.markdown('''
+<style>
+.metric-card {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin: 1rem 0;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.1);
 }
-st.markdown(risk_descriptions[risk_level], unsafe_allow_html=True)
+.portfolio-header {
+    background: linear-gradient(90deg, #4CAF50, #2196F3);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: bold;
+}
+.stButton > button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+    transition: all 0.3s ease;
+}
+</style>
+''', unsafe_allow_html=True)
 
-# Add Start Year and End Year dropdowns (max 15 years ago)
-current_year = datetime.now().year
-max_years = 15
-year_options = list(range(current_year, current_year - max_years, -1))
-col1, col2 = st.columns(2)
-with col1:
-    start_year = st.selectbox(
-        "Start Year ",
-        options=year_options[::-1],  # Ascending order for start
-        index=len(year_options) - 1,
-        help="Select the starting year for your analysis (max 15 years ago)."
-    )
-with col2:
-    end_year = st.selectbox(
-        "End Year ",
-        options=year_options,
-        index=0,
-        help="Select the ending year for your analysis."
-    )
-if start_year > end_year:
-    st.warning("Start Year must be less than or equal to End Year.")
-    st.stop()
-# Store in session state for later use
-st.session_state['start_year'] = start_year
-st.session_state['end_year'] = end_year
+# Add custom CSS for tooltips
+st.markdown('''
+<style>
+    /* Tooltip styling for dataframe cells */
+    .stDataFrame [title] {
+        position: relative;
+    }
+    .stDataFrame [title]:hover::after {
+        content: attr(title);
+        position: absolute;
+        bottom: 100%;
+        left: 50%;
+        transform: translateX(-50%);
+        background-color: #333;
+        color: white;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        white-space: nowrap;
+        z-index: 1000;
+    }
+</style>
+''', unsafe_allow_html=True)
 
-# Inside the form only include tickers and button
-with st.form("portfolio_input_form"):
-    selected_tickers = st.multiselect(
-        "Stock Tickers",
-        options=all_tickers,
-        default=["AAPL", "TSLA", "MSFT"],
-        help="Start typing to search and select tickers from the S&P 500."
+# Helper Functions
+def format_value(value: Union[float, int], prefix: str = "$", suffix: str = "", decimals: int = 2) -> str:
+    """Format numeric value with prefix, suffix, and decimal places"""
+    try:
+        if pd.isna(value) or value is None:
+            return "N/A"
+        return f"{prefix}{value:,.{decimals}f}{suffix}"
+    except Exception:
+        return "N/A"
+
+def remove_duplicates(items: List[str]) -> List[str]:
+    """Remove duplicate items while preserving order"""
+    return list(dict.fromkeys(items))
+
+def get_proxy_dict(probability: float = 0.5) -> Optional[Dict[str, str]]:
+    """Get a random proxy with given probability"""
+    if not PROXY_AVAILABLE:
+        return None
+        
+    if random.random() < probability:
+        try:
+            proxy = FreeProxy(rand=True).get()
+            return {"http": proxy}
+        except Exception as e:
+            if st.session_state.get('debug_mode', False):
+                st.error(f"Proxy error: {str(e)}")
+            return None
+    return None
+
+def get_period_from_timeframe(timeframe: str) -> tuple:
+    """Convert timeframe to yfinance period and interval"""
+    timeframe_map = {
+        '1D': ('1d', '1m'),
+        '5D': ('5d', '5m'),
+        '1M': ('1mo', '1d'),
+        '6M': ('6mo', '1d'),  # Changed from '6mo' to ensure consistency
+        '1Y': ('1y', '1d'),
+        'YTD': ('ytd', '1d'),  # Explicitly use 'ytd' period
+        '5Y': ('5y', '1wk'),
+        '10Y': ('10y', '1mo')
+    }
+    return timeframe_map.get(timeframe, ('1mo', '1d'))
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_stock_info(ticker: str) -> Optional[Dict]:
+    """Fetch stock information with proxy rotation"""
+    if not YFINANCE_AVAILABLE:
+        st.error("yfinance is required for this feature")
+        return None
+        
+    proxy = get_proxy_dict()
+    try:
+        ticker_obj = yf.Ticker(ticker, proxy=proxy)
+        info = ticker_obj.info
+        if not info or "quoteType" not in info:
+            return None
+        return info
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error fetching info for {ticker}: {str(e)}")
+        return None
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_stock_history(
+    ticker: str,
+    period: Optional[str] = None,
+    interval: str = "1d",
+    start: Optional[Union[str, datetime]] = None,
+    end: Optional[Union[str, datetime]] = None
+) -> Optional[pd.DataFrame]:
+    """Fetch historical stock data with proxy rotation"""
+    if not YFINANCE_AVAILABLE:
+        st.error("yfinance is required for this feature")
+        return None
+        
+    proxy = get_proxy_dict()
+    try:
+        ticker_obj = yf.Ticker(ticker, proxy=proxy)
+        
+        # Convert datetime objects to strings if needed
+        start_str = start.strftime('%Y-%m-%d') if isinstance(start, datetime) else start
+        end_str = end.strftime('%Y-%m-%d') if isinstance(end, datetime) else end
+        
+        if start_str and end_str:
+            hist = ticker_obj.history(start=start_str, end=end_str, interval=interval)
+        elif period:
+            hist = ticker_obj.history(period=period, interval=interval)
+        else:
+            return None
+            
+        if hist.empty:
+            return None
+            
+        return hist
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error fetching history for {ticker}: {str(e)}")
+        return None
+
+@st.cache_data(ttl=86400)  # Cache for 24 hours
+def fetch_financial_statement(
+    ticker: str,
+    statement_type: str,
+    period: str = "Annual"
+) -> Optional[pd.DataFrame]:
+    """Fetch financial statements with proxy rotation"""
+    if not YFINANCE_AVAILABLE:
+        st.error("yfinance is required for this feature")
+        return None
+        
+    proxy = get_proxy_dict()
+    try:
+        ticker_obj = yf.Ticker(ticker, proxy=proxy)
+        
+        if statement_type == "balance":
+            data = ticker_obj.balance_sheet if period == "Annual" else ticker_obj.quarterly_balance_sheet
+        elif statement_type == "income":
+            data = ticker_obj.income_stmt if period == "Annual" else ticker_obj.quarterly_income_stmt
+        elif statement_type == "cashflow":
+            data = ticker_obj.cashflow if period == "Annual" else ticker_obj.quarterly_cashflow
+        else:
+            return None
+            
+        if data is None or data.empty:
+            return None
+            
+        # Filter out columns with too many NaN values
+        return data.loc[:, data.isna().mean() < 0.5]
+        
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error fetching {statement_type} for {ticker}: {str(e)}")
+        return None
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_market_data(url: str) -> Optional[pd.DataFrame]:
+    """Fetch market data from web with proxy rotation"""
+    if not WEB_SCRAPING_AVAILABLE:
+        st.error("requests and BeautifulSoup are required for this feature")
+        return None
+        
+    proxy = get_proxy_dict()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, proxies=proxy, headers=headers, timeout=10)
+        response.raise_for_status()
+        tables = pd.read_html(response.content)
+        if not tables:
+            return None
+        return tables[0]  # Return first table
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error fetching market data: {str(e)}")
+        return None
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_sector_performance() -> Optional[pd.DataFrame]:
+    """Fetch sector performance data with proxy rotation"""
+    if not YFINANCE_AVAILABLE:
+        return None
+        
+    # Using SPDR sector ETFs as proxies
+    sector_etfs = {
+        "XLK": "Technology",
+        "XLF": "Financials",
+        "XLV": "Healthcare",
+        "XLE": "Energy",
+        "XLI": "Industrials",
+        "XLP": "Consumer Staples",
+        "XLY": "Consumer Discretionary",
+        "XLB": "Materials",
+        "XLU": "Utilities",
+        "XLRE": "Real Estate"
+    }
+    
+    performance_data = []
+    for etf, sector in sector_etfs.items():
+        hist = fetch_stock_history(etf, period="1mo")
+        if hist is not None and not hist.empty:
+            start_price = hist["Close"].iloc[0]
+            end_price = hist["Close"].iloc[-1]
+            change_pct = ((end_price - start_price) / start_price) * 100
+            performance_data.append({
+                "Sector": sector,
+                "Change %": round(change_pct, 2),
+                "ETF": etf
+            })
+    
+    if not performance_data:
+        return None
+        
+    df = pd.DataFrame(performance_data).sort_values("Change %", ascending=False)
+    
+    # Format the Change % column in the DataFrame with color coding
+    def color_change(val):
+        if val > 0:
+            return f"color: green; font-weight: bold;"
+        elif val < 0:
+            return f"color: red; font-weight: bold;"
+        return ""
+    
+    # Apply styling to the DataFrame
+    styled_df = df.style.applymap(color_change, subset=['Change %'])
+    styled_df = styled_df.format({'Change %': '{:.2f}%'})
+    
+    # Display the styled DataFrame
+    st.dataframe(styled_df, use_container_width=True)
+    
+    # Create a bar chart with green-to-red gradient
+    fig = px.bar(
+        df,
+        x='Sector',
+        y='Change %',
+        color='Change %',  # This will create the color scale
+        color_continuous_scale=['red', 'lightgray', 'green'],  # Red to green
+        color_continuous_midpoint=0,  # Neutral at 0%
+        text='Change %',
+        labels={'Change %': '1 Month Change (%)'},
+        hover_data={'ETF': True}
     )
-    custom_weights = {}
-    total_weight = 0
-    if risk_level == "Custom" and selected_tickers:
-        st.markdown("### Manual Allocation")
-        # Remove weights for unselected tickers
-        for t in list(st.session_state['custom_weight_inputs'].keys()):
-            if t not in selected_tickers:
-                del st.session_state['custom_weight_inputs'][t]
-        # Add new tickers with default 0.0
-        for t in selected_tickers:
-            if t not in st.session_state['custom_weight_inputs']:
-                st.session_state['custom_weight_inputs'][t] = 0.0
-        # Input fields and update session state
-        for ticker in selected_tickers:
-            weight = st.number_input(
-                f"Weight for {ticker} (%)",
-                min_value=0.0,
-                max_value=100.0,
-                step=0.1,
-                format="%.2f",
-                value=st.session_state['custom_weight_inputs'][ticker],
-                key=f"weight_{ticker}"
+    
+    # Customize the chart appearance
+    fig.update_traces(
+        texttemplate='%{text:.2f}%',
+        textposition='outside',
+        marker_line_color='rgba(0,0,0,0.2)',
+        marker_line_width=1
+    )
+    
+    fig.update_layout(
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        xaxis_title=None,
+        yaxis_title='Change (%)',
+        coloraxis_showscale=False,  # Hide the color scale legend
+        height=500,
+        hovermode='x unified',
+        xaxis={'tickangle': 45},
+        margin=dict(t=50, b=100)
+    )
+    
+    # Display the chart
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Add a note about the data source
+    st.caption("""
+        💡 Data based on SPDR sector ETFs. Performance shown is the 1-month percentage change.
+        ETFs used: XLK (Tech), XLF (Financials), XLV (Healthcare), XLE (Energy), XLI (Industrials),
+        XLP (Staples), XLY (Discretionary), XLB (Materials), XLU (Utilities), XLRE (Real Estate)
+    """)
+    
+    return df
+
+@st.cache_data(ttl=86400)  # Cache for 24 hours
+def fetch_sp500_tickers() -> List[str]:
+    """Fetch S&P 500 ticker symbols"""
+    if not WEB_SCRAPING_AVAILABLE:
+        # Fallback list of popular S&P 500 stocks
+        return [
+            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK-B', 'UNH', 'JNJ',
+            'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'PFE', 'ABBV', 'BAC',
+            'KO', 'AVGO', 'PEP', 'TMO', 'COST', 'DIS', 'ABT', 'WMT', 'CRM', 'MRK',
+            'NFLX', 'ADBE', 'ACN', 'NKE', 'LLY', 'DHR', 'TXN', 'NEE', 'VZ', 'BMY',
+            'QCOM', 'PM', 'T', 'UPS', 'RTX', 'SCHW', 'HON', 'LOW', 'AMD', 'AMGN'
+        ]
+    
+    try:
+        # Try to fetch from Wikipedia
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        tables = pd.read_html(response.content)
+        if tables and len(tables) > 0:
+            df = tables[0]
+            # The first column usually contains the ticker symbols
+            if 'Symbol' in df.columns:
+                tickers = df['Symbol'].tolist()
+            elif len(df.columns) > 0:
+                tickers = df.iloc[:, 0].tolist()
+            else:
+                return []
+            
+            # Clean up tickers
+            tickers = [str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()]
+            # Remove any invalid tickers
+            tickers = [t for t in tickers if t and len(t) <= 5 and t != 'NAN']
+            
+            return sorted(tickers)
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error fetching S&P 500 tickers: {str(e)}")
+    
+    # Return fallback list if fetching fails
+    return [
+        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK-B', 'UNH', 'JNJ',
+        'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'PFE', 'ABBV', 'BAC',
+        'KO', 'AVGO', 'PEP', 'TMO', 'COST', 'DIS', 'ABT', 'WMT', 'CRM', 'MRK',
+        'NFLX', 'ADBE', 'ACN', 'NKE', 'LLY', 'DHR', 'TXN', 'NEE', 'VZ', 'BMY',
+        'QCOM', 'PM', 'T', 'UPS', 'RTX', 'SCHW', 'HON', 'LOW', 'AMD', 'AMGN'
+    ]
+
+def get_asset_price_change(ticker: str, period: str = "1mo") -> Optional[Dict[str, float]]:
+    """Fetch asset's current price and % change over the given period."""
+    df = fetch_stock_history(ticker, period=period)
+    if df is not None and not df.empty:
+        start = df['Close'].iloc[0]
+        end = df['Close'].iloc[-1]
+        pct_change = ((end - start) / start) * 100
+        return {
+            'current_price': end,
+            'pct_change': pct_change
+        }
+    return None
+
+def plot_gauge(value: float, min_val: float, max_val: float, title: str) -> go.Figure:
+    """Create a gauge chart"""
+    try:
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=value,
+            domain={'x': [0, 1], 'y': [0, 1]},
+            gauge={
+                'axis': {'range': [min_val, max_val]},
+                'bar': {'color': "darkblue"},
+                'steps': [
+                    {'range': [min_val, max_val/2], 'color': "lightgray"},
+                    {'range': [max_val/2, max_val], 'color': "gray"}
+                ]
+            },
+            title={'text': title}
+        ))
+        return fig
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error creating gauge chart: {str(e)}")
+        return None
+
+def plot_candles_stick_bar(data: pd.DataFrame, title: str) -> go.Figure:
+    """Create a candlestick chart"""
+    try:
+        fig = go.Figure(data=[go.Candlestick(
+            x=data.index,
+            open=data['Open'],
+            high=data['High'],
+            low=data['Low'],
+            close=data['Close']
+        )])
+        
+        fig.update_layout(
+            title=title,
+            yaxis_title='Price',
+            xaxis_title='Date',
+            height=400
+        )
+        
+        return fig
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error creating candlestick chart: {str(e)}")
+        return None
+
+def info_table(info: Dict) -> pd.DataFrame:
+    """Create a formatted info table from stock info"""
+    try:
+        if not info:
+            return None
+            
+        # Select relevant fields
+        fields = {
+            'shortName': 'Name',
+            'symbol': 'Symbol',
+            'marketCap': 'Market Cap',
+            'trailingPE': 'P/E Ratio',
+            'forwardPE': 'Forward P/E',
+            'dividendYield': 'Dividend Yield',
+            'beta': 'Beta',
+            'fiftyTwoWeekHigh': '52W High',
+            'fiftyTwoWeekLow': '52W Low',
+            'averageVolume': 'Avg Volume'
+        }
+        
+        # Create table
+        data = {display: info.get(field) for field, display in fields.items()}
+        df = pd.DataFrame([data])
+        
+        # Format values
+        if 'Market Cap' in df.columns:
+            df['Market Cap'] = df['Market Cap'].apply(lambda x: format_value(x) if pd.notnull(x) else 'N/A')
+        if 'Dividend Yield' in df.columns:
+            df['Dividend Yield'] = df['Dividend Yield'].apply(lambda x: f"{x*100:.2f}%" if pd.notnull(x) else 'N/A')
+        if 'Avg Volume' in df.columns:
+            df['Avg Volume'] = df['Avg Volume'].apply(lambda x: format_value(x, prefix='', suffix='', decimals=0) if pd.notnull(x) else 'N/A')
+        
+        return df
+        
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error creating info table: {str(e)}")
+        return None
+
+def top_table(data: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    """Create a top N table from DataFrame"""
+    try:
+        if data is None or data.empty:
+            return None
+        return data.head(n)
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error creating top table: {str(e)}")
+        return None
+
+def analyze_portfolio(tickers: List[str]):
+    """Analyze portfolio with basic info using selected year range"""
+    with st.spinner("Analyzing portfolio..."):
+        start_date = st.session_state.get('start_date')
+        end_date = st.session_state.get('end_date')
+        
+        # Calculate per-ticker metrics
+        returns = []
+        volatilities = []
+        change_pcts = []
+        current_prices = []
+        market_caps = []
+        pe_ratios = []
+        betas = []
+        names = []
+        
+        for ticker in tickers:
+            info = fetch_stock_info(ticker)
+            hist = fetch_stock_history(
+                ticker,
+                start=start_date,
+                end=end_date
             )
-            st.session_state['custom_weight_inputs'][ticker] = weight
-        # Calculate total weight from session state
-        total_weight = sum(st.session_state['custom_weight_inputs'][t] for t in selected_tickers)
-        st.markdown(f"**Total Allocation: {total_weight:.2f}%**")
-        if abs(total_weight - 100.0) > 0.01:
-            st.warning("Total allocation must be exactly 100%. Adjust the weights above.")
-    create_portfolio = st.form_submit_button(
-        "Update Portfolio" if st.session_state.get('portfolio_created') else "Create Portfolio"
-    )
+            
+            if info and hist is not None and not hist.empty:
+                # Calculate metrics
+                daily_returns = hist["Close"].pct_change().dropna()
+                annual_return = (1 + daily_returns.mean()) ** 252 - 1
+                annual_volatility = daily_returns.std() * (252 ** 0.5)
+                
+                start_price = hist["Close"].iloc[0]
+                end_price = hist["Close"].iloc[-1]
+                pct_change = ((end_price - start_price) / start_price) * 100
+                
+                # Store metrics
+                returns.append(annual_return)
+                volatilities.append(annual_volatility)
+                change_pcts.append(pct_change)
+                current_prices.append(end_price)
+                market_caps.append(info.get('marketCap'))
+                pe_ratios.append(info.get('trailingPE'))
+                betas.append(info.get('beta'))
+                names.append(info.get('shortName', 'N/A'))
+            else:
+                # Handle missing data
+                returns.append(None)
+                volatilities.append(None)
+                change_pcts.append(None)
+                current_prices.append(None)
+                market_caps.append(None)
+                pe_ratios.append(None)
+                betas.append(None)
+                names.append('N/A')
+        
+        # Create portfolio data DataFrame
+        portfolio_data = pd.DataFrame({
+            'Ticker': tickers,
+            'Name': names,
+            'Current Price': [f"${price:.2f}" if price else 'N/A' for price in current_prices],
+            'Expected Return': [f"{ret*100:.2f}%" if ret else 'N/A' for ret in returns],
+            'Volatility': [f"{vol*100:.2f}%" if vol else 'N/A' for vol in volatilities],
+            'Change %': [f"{chg:.2f}%" if chg else 'N/A' for chg in change_pcts],
+            'Market Cap': [format_value(mc) if mc else 'N/A' for mc in market_caps],
+            'P/E Ratio': [f"{pe:.2f}" if pe else 'N/A' for pe in pe_ratios],
+            'Beta': [f"{beta:.2f}" if beta else 'N/A' for beta in betas]
+        })
+        
+        if not portfolio_data.empty:
+            st.dataframe(portfolio_data, use_container_width=True)
+            return True, portfolio_data
+        else:
+            st.error("Could not fetch data for any stocks in the portfolio")
+            return False, None
 
 def get_optimized_weights(mean_returns, cov_matrix, risk_level):
+    """Optimize portfolio weights based on risk level using modern portfolio theory."""
     n_assets = len(mean_returns)
     args = (mean_returns, cov_matrix)
 
@@ -1203,1409 +692,722 @@ def get_optimized_weights(mean_returns, cov_matrix, risk_level):
         result = minimize(portfolio_volatility, initial_weights, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
     elif risk_level == "Moderate":
         result = minimize(negative_sharpe, initial_weights, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
-    else:  # High risk
+    else:  # High
         result = minimize(negative_return, initial_weights, args=(mean_returns,), method='SLSQP', bounds=bounds, constraints=constraints)
 
     return result.x if result.success else initial_weights
 
-if create_portfolio and selected_tickers:
-    # Convert years to date strings for yfinance
-    start_date = f"{st.session_state['start_year']}-01-01"
-    end_date = f"{st.session_state['end_year']}-12-31"
-    if risk_level == "Custom":
-        # Use custom weights from session state
-        custom_weights = {t: st.session_state['custom_weight_inputs'].get(t, 0.0) for t in selected_tickers}
-        total_weight = sum(custom_weights[t] for t in selected_tickers)
-        if abs(total_weight - 100.0) > 0.01:
-            st.error("Custom allocation must sum to exactly 100%. Please adjust your weights.")
-            st.stop()
-        weights = np.array([custom_weights[t] / 100 for t in selected_tickers])
-        valid_tickers = selected_tickers
-    else:
-        n = len(selected_tickers)
-        # Download price data for tickers to compute mean_returns and cov_matrix
-        with st.spinner("Downloading price data for optimization..."):
-            data = yf.download(selected_tickers, start=start_date, end=end_date, interval="1d", threads=True)
-        if isinstance(data.columns, pd.MultiIndex):
-            close_prices = pd.DataFrame({t: data['Close', t] for t in selected_tickers if ('Close', t) in data.columns})
-        else:
-            close_prices = pd.DataFrame({selected_tickers[0]: data['Close']})
-        close_prices = close_prices.dropna(axis=1, how='all').ffill().bfill()
-        returns = close_prices.pct_change().dropna()
-        mean_returns = returns.mean() * 252
-        cov_matrix = returns.cov() * 252
-        
-        # Add guard clause for empty data
-        if mean_returns.empty or cov_matrix.empty:
-            st.error("Not enough data to optimize portfolio. Please check your selected tickers and time range.")
-            st.stop()
-            
-        weights = get_optimized_weights(mean_returns.values, cov_matrix.values, risk_level)
-        valid_tickers = list(close_prices.columns)  # Use only tickers with valid data
-        custom_weights = {t: w * 100 for t, w in zip(valid_tickers, weights)}
-    
-    # Use only valid tickers that have data
-    tickers = valid_tickers
-    allocation = {tickers[i]: weights[i] * 100 for i in range(len(tickers))}
-    st.session_state['optimal_result'] = allocation
-    st.session_state['portfolio_created'] = True
-    st.session_state['selected_tickers'] = tickers  # Store only valid tickers
-    st.session_state['risk_level'] = risk_level
-    # Store close_prices and weights in session state for later use
-    st.session_state['close_prices'] = close_prices
-    st.session_state['portfolio_weights'] = weights
-    # Trigger portfolio calculation
-    try:
-        with st.spinner("Downloading price data..."):
-            data = yf.download(tickers + ["SPY"], start=start_date, end=end_date, interval="1d", threads=True)
-        
-        # Fetch ticker info in parallel
-        with st.spinner("Fetching ticker information..."):
-            fetch_ticker_info_parallel(tickers)
-            
-        if isinstance(data.columns, pd.MultiIndex):
-            close_prices = pd.DataFrame({t: data['Close', t] for t in tickers if ('Close', t) in data.columns})
-            spy_prices = data['Close', 'SPY'] if ('Close', 'SPY') in data.columns else None
-        else:
-            close_prices = pd.DataFrame({tickers[0]: data['Close']})
-            spy_prices = None
-        close_prices = close_prices.dropna(axis=1, how='all').ffill().bfill()
-        returns = close_prices.pct_change().dropna()
-        mean_returns = returns.mean()
-        volatilities = returns.std()
-        cov_matrix = returns.cov()
-        expected_return = np.dot(weights, mean_returns) * 252
-        volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))
-        sharpe_ratio = expected_return / volatility if volatility > 0 else 0
-        st.session_state['optimal_metrics'] = {
-            'expected_return': expected_return,
-            'volatility': volatility,
-            'sharpe_ratio': sharpe_ratio
-        }
-        latest_prices = []
-        betas = []
-        expected_returns = []
-        volatilities = []
-        for i, t in enumerate(tickers):
-            try:
-                info = get_info(t)
-                price = info.get('regularMarketPrice', np.nan)
-                beta = info.get('beta', np.nan)
-                # Calculate annualized volatility for each ticker
-                try:
-                    ticker_returns = returns[t]
-                    ann_vol = ticker_returns.std() * np.sqrt(252)
-                except Exception:
-                    ann_vol = np.nan
-                latest_prices.append(price)
-                betas.append(beta)
-                expected_returns.append(mean_returns[t] * 252)
-                volatilities.append(ann_vol)
-            except Exception:
-                latest_prices.append(np.nan)
-                betas.append(np.nan)
-                expected_returns.append(np.nan)
-                volatilities.append(np.nan)
-        table_df = pd.DataFrame({
-            'Ticker': tickers,
-            'Weight %': [f"{w*100:.2f}%" for w in weights],
-            'Latest Price': latest_prices,
-            'Exp. Ann. Return': [f"{r:.2%}" for r in expected_returns],
-            'Volatility': [f"{v:.2%}" if pd.notna(v) else 'N/A' for v in volatilities],
-            'Beta': betas
-        })
-        # Format Latest Price column with currency
-        table_df['Latest Price'] = table_df['Latest Price'].apply(lambda x: f"${x:,.2f}" if pd.notna(x) else 'N/A')
-        st.session_state['optimal_table'] = table_df
-        if not close_prices.empty:
-            port_returns = (returns * weights).sum(axis=1)
-            port_cum = (1 + port_returns).cumprod()
-            backtest_df = pd.DataFrame({'Portfolio': port_cum})
-            if spy_prices is not None:
-                spy_returns = spy_prices.pct_change().dropna()
-                spy_cum = (1 + spy_returns).cumprod()
-                backtest_df['SPY'] = spy_cum
-            st.session_state['optimal_backtest'] = backtest_df
-        with st.spinner("Fetching sector data..."):
-            sector_map, missing_tickers = get_sector_allocation_from_yfinance(list(allocation.keys()))
-            st.session_state['sector_map'] = sector_map
-            st.session_state['missing_tickers'] = missing_tickers
-    except Exception as e:
-        st.warning(f"Error computing optimal portfolio: {e}")
-        st.text(traceback.format_exc())
-        st.session_state['optimal_result'] = None
-        st.session_state['optimal_metrics'] = None
-        st.session_state['optimal_backtest'] = None
-        st.session_state['optimal_table'] = None
-        st.session_state['sector_map'] = None
-        st.session_state['missing_tickers'] = None
+def color_performance(val):
+    if isinstance(val, str) and '%' in val:
+        try:
+            num = float(val.replace('%', '').replace('+', ''))
+            if num > 0:
+                return 'background-color: rgba(0, 255, 0, 0.1); color: green'
+            elif num < 0:
+                return 'background-color: rgba(255, 0, 0, 0.1); color: red'
+        except:
+            pass
+    return ''
 
-# After portfolio creation, render Optimal Portfolio section
-if st.session_state.get('portfolio_created'):
-    if st.session_state.get('optimal_result'):
-        metrics = st.session_state.get('optimal_metrics', {})
-        st.markdown("### Optimal Portfolio Metrics")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Expected Annual Return", f"{metrics.get('expected_return', 0):.2%}")
-        m2.metric("Volatility (Risk)", f"{metrics.get('volatility', 0):.2%}")
-        m3.metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}")
-        st.markdown("### Optimal Portfolio Allocation")
-        alloc_col, sector_col = st.columns(2)
-        with alloc_col:
-            alloc = st.session_state['optimal_result']
-            
-            # Format values for better display
-            formatted_values = [round(val, 2) for val in list(alloc.values())]
-            
-            fig = go.Figure(data=[go.Pie(
-                labels=list(alloc.keys()), 
-                values=formatted_values, 
-                hole=0.3,
-                hoverinfo='label+percent+value',
-                texttemplate='%{label}: %{percent:.1%}',
-                marker=dict(
-                    colors=BLUE_PALETTE,
-                    line=dict(color='white', width=2)
-                )
-            )])
-            
-            fig.update_traces(
-                textposition='inside',
-                textfont_size=12
+def display_optimal_portfolio(tickers: List[str]):
+    """Display optimal portfolio allocation and metrics based on selected risk level."""
+    risk_level = st.session_state.get('risk_level', 'Moderate')
+    start_date = st.session_state.get('start_date')
+    end_date = st.session_state.get('end_date')
+    
+    # Risk level descriptions and icons
+    risk_descriptions = {
+        "Low": "🛡️ Low Risk - Minimizing Portfolio Volatility",
+        "Moderate": "⚖️ Moderate Risk - Maximizing Sharpe Ratio", 
+        "High": "🚀 High Risk - Maximizing Expected Returns",
+        "Custom": "🎛️ Custom Risk - Manual Weight Selection"
+    }
+    
+    # Show portfolio info in a single line
+    st.info(f"**Portfolio:** {', '.join(tickers)} | **Strategy:** {risk_descriptions.get(risk_level, risk_level)} | **Year Range:** {start_date.year} to {end_date.year}")
+    
+    # Initialize weights and metrics
+    weights = None
+    metrics = None
+    
+    # Fetch historical data and calculate returns
+    with st.spinner("Calculating portfolio metrics..."):
+        returns_data = {}
+        for ticker in tickers:
+            hist = fetch_stock_history(
+                ticker,
+                start=start_date,
+                end=end_date
             )
+            if hist is not None and not hist.empty:
+                returns_data[ticker] = hist['Close'].pct_change().dropna()
+        
+        if returns_data:
+            returns_df = pd.DataFrame(returns_data)
             
-            fig.update_layout(
-                title="Portfolio Allocation",
-                title_font_size=18,
-                margin=dict(l=20, r=20, t=40, b=20), 
-                height=400,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.2)
-            )
+            # Validate returns data
+            if returns_df.empty:
+                st.error("Not enough data to optimize. Please check tickers and time range.")
+                st.stop()
             
-            st.plotly_chart(fig, use_container_width=True, key="alloc_pie")
-        with sector_col:
-            sector_map, missing_tickers = get_sector_allocation_from_yfinance(list(st.session_state['optimal_result'].keys()))
-            if sector_map:
-                # Calculate sector weights based on portfolio allocation
-                sector_weights = {}
-                for ticker, weight in st.session_state['optimal_result'].items():
-                    sector = sector_map.get(ticker)
-                    if sector:
-                        sector_weights[sector] = sector_weights.get(sector, 0) + weight
+            # Calculate annualized metrics
+            mean_returns = returns_df.mean() * 252
+            cov_matrix = returns_df.cov() * 252
+            
+            # Get weights based on risk level
+            if risk_level == "Custom":
+                # Get custom weights from session state
+                custom_weights = st.session_state.get('custom_weights', {})
+                total_weight = sum(custom_weights.values())
                 
-                fig_sector = px.pie(
-                    names=list(sector_weights.keys()),
-                    values=list(sector_weights.values()),
-                    title="Sector Diversification (Weighted)",
-                    hole=0.3,
-                    color_discrete_sequence=BLUE_PALETTE
-                )
+                # Validate custom weights
+                if abs(total_weight - 100.0) > 0.01:
+                    st.warning(f"Total custom weight = {total_weight:.2f}%. Must equal 100%.")
+                    st.stop()
                 
-                fig_sector.update_traces(
-                    textposition='inside',
-                    texttemplate='%{label}: %{percent:.1%}',
-                    textfont_size=12,
-                    marker=dict(line=dict(color='white', width=2))
-                )
-                
-                fig_sector.update_layout(
-                    title_font_size=18,
-                    height=400,
-                    margin=dict(l=20, r=20, t=40, b=20),
-                    legend=dict(orientation="h", yanchor="bottom", y=-0.2)
-                )
-                
-                st.plotly_chart(fig_sector, use_container_width=True, key="sector_pie")
+                # Convert custom weights to numpy array
+                weights = np.array([custom_weights[ticker]/100.0 for ticker in tickers])
             else:
-                st.warning("No sector data available from yfinance for the selected tickers.")
-            if missing_tickers:
-                st.info(f"Could not retrieve sector data for: {missing_tickers}")
-        st.markdown("### Allocation Table")
-        table_df = st.session_state['optimal_table']
-        if 'Beta' in table_df:
-            def format_beta(val):
-                try:
-                    return f"{val:.2f}" if isinstance(val, (int, float)) else 'N/A'
-                except Exception:
-                    return 'N/A'
-            table_df['Beta'] = table_df['Beta'].apply(format_beta)
-            # Keep Beta column name simple
-            table_df.rename(columns={'Beta': 'Beta'}, inplace=True)
-        st.dataframe(table_df.style.set_properties(**{'font-size': '12px'}), use_container_width=True)
-        if st.session_state.get('optimal_backtest') is not None:
-            st.markdown("### Backtest: Cumulative Returns vs. SPY")
-            backtest_df = st.session_state['optimal_backtest']
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df['Portfolio'], mode='lines', name='Portfolio', line=dict(color=BLUE_PALETTE[0])))
-            if 'SPY' in backtest_df:
-                fig2.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df['SPY'], mode='lines', name='SPY', line=dict(color=BLUE_PALETTE[1])))
-            fig2.update_layout(xaxis_title="Date", yaxis_title="Cumulative Return", margin=dict(l=20, r=20, t=40, b=20), height=400)
-            st.plotly_chart(fig2, use_container_width=True)
-
-            # --- Annual Returns Bar Chart ---
-            st.markdown("### Annual Returns")
-            tab1, tab2 = st.tabs(["Portfolio Returns", "Returns by Ticker"])
-
-            with tab1:
-                # Get data from session state
-                close_prices = st.session_state.get('close_prices')
-                weights = st.session_state.get('portfolio_weights')
-                if close_prices is not None and weights is not None:
-                    # Calculate annual returns
-                    annual_returns = calculate_annual_returns(close_prices, weights)
-                    # Filter for selected years
-                    start_year = st.session_state['start_year']
-                    end_year = st.session_state['end_year']
-                    annual_returns = annual_returns[
-                        (annual_returns.index.year >= start_year) & 
-                        (annual_returns.index.year <= end_year)
-                    ]
-                    if not annual_returns.empty:
-                        # Create bar chart with color coding
-                        fig_annual = go.Figure()
-                        for year, ret in annual_returns.items():
-                            color = 'green' if ret > 0 else 'red'
-                            fig_annual.add_trace(go.Bar(
-                                x=[year.year],
-                                y=[ret],
-                                name=str(year.year),
-                                marker_color=color,
-                                text=[f"{ret:.1%}"],
-                                textposition='auto'
-                            ))
-                        fig_annual.update_layout(
-                            title="Portfolio Annual Returns",
-                            xaxis_title="Year",
-                            yaxis_title="Return",
-                            yaxis_tickformat=".0%",
-                            showlegend=False,
-                            margin=dict(l=20, r=20, t=40, b=20),
-                            height=400
-                        )
-                        st.plotly_chart(fig_annual, use_container_width=True)
-                    else:
-                        st.warning("Not enough data to calculate annual returns for selected period")
-                else:
-                    st.warning("Portfolio data not available. Please create a portfolio first.")
-
-            with tab2:
-                close_prices = st.session_state.get('close_prices')
-                if close_prices is not None:
-                    yearly_prices = close_prices.resample('Y').last()
-                    annual_data = []
-
-                    for ticker in close_prices.columns:
-                        returns = yearly_prices[ticker].pct_change().dropna()
-                        for dt, value in returns.items():
-                            if st.session_state['start_year'] <= dt.year <= st.session_state['end_year']:
-                                annual_data.append({
-                                    "Year": dt.year,
-                                    "Ticker": ticker,
-                                    "Return": value
-                                })
-
-                    df = pd.DataFrame(annual_data)
-                    if not df.empty:
-                        fig = px.bar(
-                            df, 
-                            x="Year", 
-                            y="Return", 
-                            color="Ticker", 
-                            barmode="group",
-                            text=df["Return"].map(lambda x: f"{x:.1%}"),
-                            title="Annual Returns by Ticker",
-                            color_discrete_sequence=['#1f77b4', '#2ca9e1', '#4dabf7', '#74c0fc', '#90d8fd', 
-                                                   '#a5d8ff', '#c4e0ff', '#d6e9ff', '#63be7b', '#8fd694']
-                        )
-                        fig.update_layout(
-                            yaxis_tickformat=".0%",
-                            height=450,
-                            margin=dict(l=20, r=20, t=40, b=20),
-                            showlegend=True,
-                            legend=dict(
-                                orientation="h",
-                                yanchor="bottom",
-                                y=1.02,
-                                xanchor="center",
-                                x=0.5
-                            )
-                        )
-                        fig.update_traces(
-                            textposition='outside',
-                            textfont_size=10,
-                            marker_line_color='rgba(0,0,0,0.5)',
-                            marker_line_width=1
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.warning("Not enough data to calculate per-ticker annual returns.")
-                else:
-                    st.warning("Portfolio data not available. Please create a portfolio first.")
-
-            # --- Efficient Frontier Visualization ---
-            st.markdown("### Efficient Frontier Portfolios")
-            # Get data from session state
-            close_prices = st.session_state.get('close_prices')
-            weights = st.session_state.get('portfolio_weights')
-            selected_tickers = st.session_state.get('selected_tickers')
+                # Optimize portfolio based on risk level
+                with st.spinner(f"Optimizing portfolio for {risk_level} risk level..."):
+                    weights = get_optimized_weights(mean_returns, cov_matrix, risk_level)
             
-            if close_prices is not None and weights is not None and selected_tickers:
-                with st.spinner("Calculating Efficient Frontier..."):
-                    # Calculate returns and covariance matrix
-                    returns = close_prices.pct_change().dropna()
-                    mean_returns = returns.mean() * 252
-                    cov_matrix = returns.cov() * 252
-                    
-                    # Helper functions
-                    def portfolio_return(weights, mean_returns):
-                        return np.dot(weights, mean_returns)
-                        
-                    def portfolio_volatility(weights, mean_returns, cov_matrix):
-                        return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-                        
-                    def get_ef_portfolios(mean_returns, cov_matrix, risk_free_rate=0.0, num_portfolios=20):
-                        args = (mean_returns, cov_matrix)
-                        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-                        bounds = tuple((0,1) for _ in range(len(mean_returns)))
-                        
-                        # Minimum volatility portfolio
-                        min_vol = minimize(portfolio_volatility, 
-                                          len(mean_returns)*[1./len(mean_returns),], 
-                                          args=args, 
-                                          method='SLSQP', 
-                                          bounds=bounds, 
-                                          constraints=constraints)
-                        
-                        # Efficient frontier
-                        target_returns = np.linspace(min_vol['fun'], max(mean_returns), num_portfolios)
-                        efficient_portfolios = []
-                        
-                        for ret in target_returns:
-                            constraints = ({'type': 'eq', 'fun': lambda x: portfolio_return(x, mean_returns) - ret},
-                                          {'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-                            opt = minimize(portfolio_volatility, 
-                                          len(mean_returns)*[1./len(mean_returns),], 
-                                          args=args, 
-                                          method='SLSQP', 
-                                          bounds=bounds, 
-                                          constraints=constraints)
-                            efficient_portfolios.append({
-                                'weights': opt.x,
-                                'return': ret,
-                                'volatility': opt.fun,
-                                'sharpe': (ret - risk_free_rate) / opt.fun if opt.fun > 0 else 0
-                            })
-                        return efficient_portfolios
-                        
-                    # Get efficient frontier portfolios
-                    ef_portfolios = get_ef_portfolios(mean_returns, cov_matrix, num_portfolios=20)
-                    st.session_state['ef_portfolios'] = ef_portfolios  # Store for click events
-                    
-                    # Create table of portfolios
-                    portfolio_table = []
-                    for i, pf in enumerate(ef_portfolios):
-                        row = {
-                            '#': i+1,
-                            **{ticker: f"{pf['weights'][j]*100:.2f}%" for j, ticker in enumerate(selected_tickers)},
-                            'Expected Return': f"{pf['return']:.2%}",
-                            'Standard Deviation': f"{pf['volatility']:.2%}",
-                            'Sharpe Ratio': f"{pf['sharpe']:.3f}"
-                        }
-                        portfolio_table.append(row)
-                    
-                    # Find max Sharpe portfolio
-                    max_sharpe_portfolio = max(ef_portfolios, key=lambda x: x['sharpe'])
-                    max_sharpe_idx = next(i for i, pf in enumerate(ef_portfolios) if pf['sharpe'] == max_sharpe_portfolio['sharpe'])
-                    
-                    # Apply styling to highlight max Sharpe row
-                    def highlight_max_sharpe(row):
-                        if row['#'] == max_sharpe_idx + 1:  # +1 because we start numbering from 1
-                            return ['background-color: #63be7b; color: white; font-weight: bold'] * len(row)
-                        return [''] * len(row)
-                    
-                    # Display the table
-                    st.dataframe(
-                        pd.DataFrame(portfolio_table).style.apply(highlight_max_sharpe, axis=1),
-                        use_container_width=True
-                    )
-                    st.caption(f"*Row {max_sharpe_idx + 1} is the optimal portfolio (max Sharpe Ratio)*")
-                    
-                    # Create scatter plot
-                    fig = go.Figure()
-                    
-                    # Add efficient frontier line
-                    fig.add_trace(go.Scatter(
-                        x=[pf['volatility'] for pf in ef_portfolios],
-                        y=[pf['return'] for pf in ef_portfolios],
-                        mode='lines+markers',
-                        name='Efficient Frontier',
-                        line=dict(color='royalblue', width=2),
-                        marker=dict(size=8, color='royalblue'),
-                        customdata=np.arange(len(ef_portfolios)),  # Store portfolio index
-                        hovertemplate="<b>Return:</b> %{y:.2%}<br>" +
-                                    "<b>Volatility:</b> %{x:.2%}<br>" +
-                                    "<extra></extra>"
-                    ))
-                    
-                    # Highlight current portfolio
-                    current_vol = portfolio_volatility(weights, mean_returns, cov_matrix)
-                    current_ret = portfolio_return(weights, mean_returns)
-                    fig.add_trace(go.Scatter(
-                        x=[current_vol],
-                        y=[current_ret],
-                        mode='markers',
-                        name='Your Portfolio',
-                        marker=dict(size=12, color='red', symbol='star'),
-                        hovertemplate="<b>Your Portfolio</b><br>" +
-                                    "<b>Return:</b> %{y:.2%}<br>" +
-                                    "<b>Volatility:</b> %{x:.2%}<br>" +
-                                    "<extra></extra>"
-                    ))
-                    
-                    # Highlight max Sharpe portfolio
-                    fig.add_trace(go.Scatter(
-                        x=[max_sharpe_portfolio['volatility']],
-                        y=[max_sharpe_portfolio['return']],
-                        mode='markers',
-                        name='Max Sharpe Ratio',
-                        marker=dict(size=12, color='green', symbol='diamond'),
-                        hovertemplate="<b>Max Sharpe</b><br>" +
-                                    "<b>Return:</b> %{y:.2%}<br>" +
-                                    "<b>Volatility:</b> %{x:.2%}<br>" +
-                                    "<extra></extra>"
-                    ))
-                    
-                    fig.update_layout(
-                        title="Efficient Frontier",
-                        xaxis_title="Volatility (Standard Deviation)",
-                        yaxis_title="Expected Return",
-                        yaxis_tickformat=".0%",
-                        xaxis_tickformat=".0%",
-                        hovermode="closest",
-                        height=500
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-
-            # --- Improved Toggle Buttons and Controls ---
-            st.markdown("---")
-            st.markdown("### Dashboard Controls")
-
-            # Add a session state key for Monte Carlo toggle if not present
-            if 'show_monte_carlo' not in st.session_state:
-                st.session_state['show_monte_carlo'] = False
-
-            toggle_cols = st.columns([1, 1, 1, 1])  # Now four columns for four buttons
-
-            with toggle_cols[0]:
-                if st.button(
-                    "📊 Show Charts" if not st.session_state.get('show_charts') else "📊 Hide Charts",
-                    use_container_width=True,
-                    type="primary" if st.session_state.get('show_charts') else "secondary",
-                    key="charts_toggle_button"
-                ):
-                    st.session_state['show_charts'] = not st.session_state.get('show_charts')
-                    st.session_state['show_financials'] = False
-                    st.session_state['show_monte_carlo'] = False
-                    st.session_state['show_market_overview'] = False
-                    st.rerun()
-
-            with toggle_cols[1]:
-                if st.button(
-                    "💰 Show Financials" if not st.session_state.get('show_financials') else "💰 Hide Financials",
-                    use_container_width=True,
-                    type="primary" if st.session_state.get('show_financials') else "secondary",
-                    key="financials_toggle_button"
-                ):
-                    st.session_state['show_financials'] = not st.session_state.get('show_financials')
-                    st.session_state['show_charts'] = False
-                    st.session_state['show_monte_carlo'] = False
-                    st.session_state['show_market_overview'] = False
-                    st.rerun()
-
-            with toggle_cols[2]:
-                if st.button(
-                    "📉 Monte Carlo Simulation" if not st.session_state.get('show_monte_carlo') else "📉 Hide Monte Carlo",
-                    use_container_width=True,
-                    type="primary" if st.session_state.get('show_monte_carlo') else "secondary",
-                    key="monte_carlo_toggle_button"
-                ):
-                    st.session_state['show_monte_carlo'] = not st.session_state.get('show_monte_carlo')
-                    st.session_state['show_charts'] = False
-                    st.session_state['show_financials'] = False
-                    st.session_state['show_market_overview'] = False
-                    st.rerun()
-
-            with toggle_cols[3]:
-                if st.button(
-                    "🌎 Market Overview" if not st.session_state.get('show_market_overview') else "🌎 Hide Market",
-                    use_container_width=True,
-                    type="primary" if st.session_state.get('show_market_overview') else "secondary",
-                    key="market_toggle_button"
-                ):
-                    st.session_state['show_market_overview'] = not st.session_state.get('show_market_overview')
-                    st.session_state['show_charts'] = False
-                    st.session_state['show_financials'] = False
-                    st.session_state['show_monte_carlo'] = False
-                    st.rerun()
-
-            # --- Monte Carlo Simulation Section (now toggled) ---
-            if st.session_state.get('show_monte_carlo') and st.session_state.get('optimal_metrics'):
-                st.markdown("### 📉 Monte Carlo Portfolio Simulation")
-                # Show selected tickers and weights
-                alloc = st.session_state.get('optimal_result', {})
-                if alloc:
-                    alloc_str = ", ".join([f"{ticker}: {weight:.2f}%" for ticker, weight in alloc.items()])
-                    st.info(f"**Portfolio:** {alloc_str}")
-                expected_return = st.session_state['optimal_metrics'].get('expected_return', None)
-                volatility = st.session_state['optimal_metrics'].get('volatility', None)
-                if expected_return is not None and volatility is not None:
-                    st.info(f"Expected Return: **{expected_return:.2%}**, Volatility: **{volatility:.2%}**")
-                else:
-                    st.warning("Please create a portfolio to enable simulation.")
-                start_value = st.number_input("Starting Portfolio Value ($)", value=10000)
-                years = st.slider("Simulation Time Horizon (Years)", 1, 30, 10)
-                simulations = st.slider("Number of Simulations", 100, 2000, 500, step=100)
-                if st.button("Run Monte Carlo Simulation"):
-                    if expected_return is None or volatility is None:
-                        st.error("Portfolio metrics not found. Please create a portfolio first.")
-                    else:
-                        results = monte_carlo_simulation(start_value, expected_return, volatility, years, simulations)
-                        final_values = results[:, -1]
-                        fig = go.Figure()
-                        for i in range(min(50, simulations)):
-                            fig.add_trace(go.Scatter(y=results[i], mode='lines', line=dict(width=1), showlegend=False))
-                        fig.update_layout(
-                            title="Monte Carlo Simulation of Portfolio Value",
-                            xaxis_title="Days",
-                            yaxis_title="Portfolio Value ($)",
-                            height=500
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                        def pct_str(final):
-                            pct = (final - start_value) / start_value * 100
-                            return f"({pct:+.2f}%)"
-                        median_val = np.median(final_values)
-                        p5_val = np.percentile(final_values, 5)
-                        p95_val = np.percentile(final_values, 95)
-                        st.write(f"**Median Final Value:** ${median_val:,.2f} {pct_str(median_val)}")
-                        st.write(f"**5th Percentile (Worst-Case):** ${p5_val:,.2f} {pct_str(p5_val)}")
-                        st.write(f"**95th Percentile (Best-Case):** ${p95_val:,.2f} {pct_str(p95_val)}")
-
-# --- Dashboard Sections ---
-if st.session_state.get('portfolio_created'):
-    # --- Charts Section ---
-    if st.session_state.get('show_charts') and not st.session_state.get('show_financials') and not st.session_state.get('show_monte_carlo') and not st.session_state.get('show_market_overview'):
-        st.markdown("### Price Charts and Key Metrics")
+            # Calculate portfolio metrics
+            if weights is not None:
+                metrics = calculate_portfolio_metrics(returns_df, weights)
+    
+    # Display portfolio metrics at the top
+    if metrics:
+        st.markdown("### Portfolio Metrics")
+        col1, col2, col3, col4 = st.columns(4)
         
-        # Period selector with more options
-        period_options = {
-            "1D": ("1d", "15m"),  # Changed interval from 5m to 15m for 1D
-            "5D": ("5d", "5m"),   # Changed interval from 15m to 5m for 5D
-            "1M": ("1mo", "30m"),
-            "6M": ("6mo", "1d"),
-            "YTD": ("ytd", "1d"),
-            "1Y": ("1y", "1d"),
-            "5Y": ("5y", "1wk"),
-            "10Y": ("10y", "1mo"),
-            "MAX": ("max", "1mo")
-        }
-        period_label = st.selectbox("Select Time Period", list(period_options.keys()))
-        period, interval = period_options[period_label]
-
-        if st.session_state.get('selected_tickers'):
-            # Add tabs for each ticker
-            tabs = st.tabs([f"📈 {ticker}" for ticker in st.session_state['selected_tickers']])
-            
-            for i, ticker in enumerate(st.session_state['selected_tickers']):
-                with tabs[i]:
-                    col1, col2 = st.columns([3, 1])
-                    
-                    with col1:
-                        # Enhanced chart with moving averages (removed volume)
-                        try:
-                            hist = yf.download(ticker, period=period, interval=interval)
-                            if hist is not None and not hist.empty:
-                                hist = hist.copy()
-                                hist.index = pd.to_datetime(hist.index)
-                                
-                                # Get close price series
-                                if isinstance(hist.columns, pd.MultiIndex):
-                                    close_series = hist[('Close', ticker)].dropna() if ('Close', ticker) in hist.columns else None
-                                else:
-                                    close_series = hist['Close'].dropna() if 'Close' in hist.columns else None
-                                
-                                if close_series is not None and not close_series.empty:
-                                    fig = go.Figure()
-                                    
-                                    # Main price line - thicker and more prominent
-                                    fig.add_trace(go.Scatter(
-                                        x=close_series.index,
-                                        y=close_series,
-                                        mode='lines',
-                                        name='Price',
-                                        line=dict(color='#1f77b4', width=3)  # Thicker line
-                                    ))
-                                    
-                                    # Layout configuration - cleaner and more compact
-                                    fig.update_layout(
-                                        title=f"{ticker} Price ({period_label})",
-                                        xaxis_title=None,  # Remove x-axis title
-                                        yaxis_title=None,  # Remove y-axis title
-                                        margin=dict(l=20, r=20, t=40, b=20),
-                                        height=350,  # Slightly shorter
-                                        showlegend=False,  # Remove legend
-                                        plot_bgcolor='rgba(0,0,0,0)',
-                                        paper_bgcolor='rgba(0,0,0,0)',
-                                        xaxis=dict(
-                                            showgrid=True,
-                                            gridcolor='rgba(211, 211, 211, 0.3)',  # Lighter grid
-                                            showline=True,
-                                            linecolor='rgba(211, 211, 211, 0.5)'
-                                        ),
-                                        yaxis=dict(
-                                            showgrid=True,
-                                            gridcolor='rgba(211, 211, 211, 0.3)',  # Lighter grid
-                                            showline=True,
-                                            linecolor='rgba(211, 211, 211, 0.5)',
-                                            side='right'  # Move y-axis to right
-                                        )
-                                    )
-                                    
-                                    # Format x-axis based on period
-                                    if period_label == "1D":
-                                        fig.update_xaxes(tickformat="%H:%M")
-                                    else:
-                                        fig.update_xaxes(tickformat="%b %d")
-                                    
-                                    st.plotly_chart(fig, use_container_width=True)
-                                else:
-                                    st.warning("No price data available for this ticker and period after cleaning.")
-                        except Exception as e:
-                            st.error(f"Error loading chart data for {ticker}: {str(e)}")
-                    
-                    with col2:
-                        # Enhanced key metrics in a compact card layout
-                        st.markdown(f"### {ticker} Metrics")
-                        
-                        try:
-                            yahoo_ticker = to_yahoo_ticker(ticker)
-                            info = yf.Ticker(yahoo_ticker).info
-                            
-                            if not info or info == {}:
-                                st.warning(f"No summary info found for {ticker}")
-                            else:
-                                # Get historical prices
-                                historical_prices = get_historical_closes(ticker)
-                                
-                                if historical_prices:
-                                    # Current price
-                                    current_price = historical_prices["Current"]
-                                    price_display = f"${current_price:,.2f}" if isinstance(current_price, (int, float)) else 'N/A'
-                                    
-                                    # Create the price display card
-                                    st.markdown(f"""
-                                    <div style="background-color: #1f77b4; border-radius: 10px; padding: 15px; margin-bottom: 15px; color: white;">
-                                        <div style="font-size: 1.8rem; font-weight: bold; margin-bottom: 5px;">{price_display}</div>
-                                        <div style="font-size: 1rem; margin: 5px 0;">Latest Close Price</div>
-                                    </div>
-                                    """, unsafe_allow_html=True)
-                                    
-                                    # Historical prices table
-                                    st.markdown("#### Historical Close Prices")
-                                    
-                                    # Create a dataframe for the historical prices
-                                    hist_df = pd.DataFrame({
-                                        "Period": ["1 Month Ago", "6 Months Ago", "YTD Start", "1 Year Ago", "5 Years Ago"],
-                                        "Price": [
-                                            f"${historical_prices['1M Ago']:,.2f}" if historical_prices['1M Ago'] else 'N/A',
-                                            f"${historical_prices['6M Ago']:,.2f}" if historical_prices['6M Ago'] else 'N/A',
-                                            f"${historical_prices['YTD Start']:,.2f}" if historical_prices['YTD Start'] else 'N/A',
-                                            f"${historical_prices['1Y Ago']:,.2f}" if historical_prices['1Y Ago'] else 'N/A',
-                                            f"${historical_prices['5Y Ago']:,.2f}" if historical_prices['5Y Ago'] else 'N/A'
-                                        ],
-                                        "% Change": [
-                                            f"{((current_price - historical_prices['1M Ago']) / historical_prices['1M Ago'] * 100):+.2f}%" if historical_prices['1M Ago'] else 'N/A',
-                                            f"{((current_price - historical_prices['6M Ago']) / historical_prices['6M Ago'] * 100):+.2f}%" if historical_prices['6M Ago'] else 'N/A',
-                                            f"{((current_price - historical_prices['YTD Start']) / historical_prices['YTD Start'] * 100):+.2f}%" if historical_prices['YTD Start'] else 'N/A',
-                                            f"{((current_price - historical_prices['1Y Ago']) / historical_prices['1Y Ago'] * 100):+.2f}%" if historical_prices['1Y Ago'] else 'N/A',
-                                            f"{((current_price - historical_prices['5Y Ago']) / historical_prices['5Y Ago'] * 100):+.2f}%" if historical_prices['5Y Ago'] else 'N/A'
-                                        ]
-                                    })
-                                    
-                                    # Style the % Change column with color coding
-                                    def color_pct_change(val):
-                                        if val == 'N/A':
-                                            return 'color: black'
-                                        try:
-                                            pct = float(val.replace('%', ''))
-                                            return 'color: green' if pct > 0 else 'color: red'
-                                        except:
-                                            return 'color: black'
-                                    
-                                    styled_df = hist_df.style.applymap(color_pct_change, subset=['% Change'])
-                                    
-                                    # Display the table with minimal styling
-                                    st.dataframe(
-                                        styled_df,
-                                        use_container_width=True,
-                                        hide_index=True,
-                                        column_config={
-                                            "Period": st.column_config.TextColumn("Period", width="medium"),
-                                            "Price": st.column_config.TextColumn("Price", width="small"),
-                                            "% Change": st.column_config.TextColumn("% Change", width="small")
-                                        }
-                                    )
-                                
-                                # Key metrics in a table-like format
-                                metrics = [
-                                    ("Market Cap", format_market_cap(info.get('marketCap', 'N/A'))),
-                                    ("PE Ratio", f"{info.get('trailingPE', 'N/A'):.2f}" if isinstance(info.get('trailingPE'), (int, float)) else 'N/A'),
-                                    ("Beta", f"{info.get('beta', 'N/A'):.2f}" if isinstance(info.get('beta'), (int, float)) else 'N/A'),
-                                    ("52W High", f"${info.get('fiftyTwoWeekHigh', 'N/A'):,.2f}" if isinstance(info.get('fiftyTwoWeekHigh'), (int, float)) else 'N/A'),
-                                    ("52W Low", f"${info.get('fiftyTwoWeekLow', 'N/A'):,.2f}" if isinstance(info.get('fiftyTwoWeekLow'), (int, float)) else 'N/A')
-                                ]
-                                
-                                st.markdown("""
-                                <style>
-                                    .metric-row {
-                                        display: flex;
-                                        justify-content: space-between;
-                                        padding: 8px 0;
-                                        border-bottom: 1px solid #eee;
-                                    }
-                                    .metric-label {
-                                        font-weight: bold;
-                                        color: #555;
-                                    }
-                                    .metric-value {
-                                        text-align: right;
-                                    }
-                                </style>
-                                """, unsafe_allow_html=True)
-                                
-                                for label, value in metrics:
-                                    st.markdown(f"""
-                                    <div class="metric-row">
-                                        <span class="metric-label">{label}</span>
-                                        <span class="metric-value">{value}</span>
-                                    </div>
-                                    """, unsafe_allow_html=True)
-                                
-                                # Company info section
-                                sector = info.get('sector', 'N/A')
-                                industry = info.get('industry', 'N/A')
-                                employees = info.get('fullTimeEmployees', 'N/A')
-                                
-                                # Fallback to Kaggle CSV if missing
-                                if kaggle_df is not None:
-                                    row = kaggle_df[kaggle_df['Symbol'].str.upper() == ticker.upper()]
-                                    if not row.empty:
-                                        if sector == 'N/A' and 'Sector' in row:
-                                            sector = row['Sector'].values[0]
-                                        if industry == 'N/A' and 'Industry' in row:
-                                            industry = row['Industry'].values[0]
-                                        if employees == 'N/A' and 'Full Time Employees' in row:
-                                            employees = row['Full Time Employees'].values[0]
-                                
-                                st.markdown(f"""
-                                <div style="margin-top: 20px; font-size: 0.9rem;">
-                                    <div><strong>Sector:</strong> {sector}</div>
-                                    <div><strong>Industry:</strong> {industry}</div>
-                                    <div><strong>Employees:</strong> {employees if employees != 'N/A' else 'N/A'}</div>
-                                </div>
-                                """, unsafe_allow_html=True)
-                                
-                        except Exception as e:
-                            st.error(f"Error fetching metrics for {ticker}: {str(e)}")
-
-    # --- Financials Section ---
-    if st.session_state.get('show_financials') and not st.session_state.get('show_charts') and not st.session_state.get('show_monte_carlo') and not st.session_state.get('show_market_overview'):
-        st.markdown("### Financial Analysis")
+        with col1:
+            st.metric(
+                "Annual Return",
+                f"{metrics['annual_return']*100:.2f}%",
+                help="Expected annual return based on historical data"
+            )
+        with col2:
+            st.metric(
+                "Annual Volatility",
+                f"{metrics['annual_vol']*100:.2f}%",
+                help="Expected annual volatility (standard deviation of returns)"
+            )
+        with col3:
+            st.metric(
+                "Sharpe Ratio",
+                f"{metrics['sharpe_ratio']:.2f}",
+                help="Risk-adjusted return (higher is better)"
+            )
+        with col4:
+            st.metric(
+                "Max Drawdown",
+                f"{metrics['max_drawdown']*100:.2f}%",
+                help="Largest historical percentage drop from peak"
+            )
+    
+    # Display allocation details
+    if weights is not None:
+        # --- Parallel, cached info fetching ---
+        with st.spinner("Fetching company info for all tickers..."):
+            # Use session cache for all tickers
+            cache = st.session_state.setdefault('stock_info_cache', {})
+            missing = [t for t in tickers if t not in cache]
+            if missing:
+                fetched = fetch_all_stock_info(missing)
+                cache.update(fetched)
+            info_dict = {t: cache.get(t) for t in tickers}
         
-        selected_ticker = st.selectbox(
-            "Select Company to View Financials",
-            options=st.session_state.get('selected_tickers', []),
-            key="financial_ticker_selector"
+        returns_data = {}
+        for ticker in tickers:
+            hist = fetch_stock_history(
+                ticker,
+                start=start_date,
+                end=end_date
+            )
+            info = info_dict.get(ticker)
+            if hist is not None and not hist.empty:
+                daily_returns = hist["Close"].pct_change().dropna()
+                annual_return = (1 + daily_returns.mean()) ** 252 - 1
+                annual_volatility = daily_returns.std() * (252 ** 0.5)
+                start_price = hist["Close"].iloc[0]
+                end_price = hist["Close"].iloc[-1]
+                pct_change = ((end_price - start_price) / start_price) * 100
+                returns_data[ticker] = {
+                    'Name': info.get('shortName', 'N/A') if info else 'N/A',
+                    'Expected Return': f"{annual_return*100:.2f}%",
+                    'Volatility': f"{annual_volatility*100:.2f}%",
+                    'Change %': f"{pct_change:.2f}%",
+                    'Market Cap': format_value(info.get('marketCap')) if info else 'N/A',
+                    'P/E Ratio': f"{info.get('trailingPE', 'N/A')}" if info else 'N/A',
+                    'Beta': f"{info.get('beta', 'N/A')}" if info else 'N/A'
+                }
+            else:
+                returns_data[ticker] = {
+                    'Name': info.get('shortName', 'N/A') if info else 'N/A',
+                    'Expected Return': 'N/A',
+                    'Volatility': 'N/A',
+                    'Change %': 'N/A',
+                    'Market Cap': format_value(info.get('marketCap')) if info else 'N/A',
+                    'P/E Ratio': f"{info.get('trailingPE', 'N/A')}" if info else 'N/A',
+                    'Beta': f"{info.get('beta', 'N/A')}" if info else 'N/A'
+                }
+        # Create portfolio data DataFrame
+        portfolio_data = pd.DataFrame.from_dict(returns_data, orient='index')
+        portfolio_data.index.name = 'Ticker'
+        portfolio_data.reset_index(inplace=True)
+        # Add weights to the portfolio data
+        portfolio_data['Weight'] = [f"{w*100:.1f}%" for w in weights]
+        # Add Current Price and Start of Period Price columns
+        current_prices = []
+        start_prices = []
+        for ticker in portfolio_data['Ticker']:
+            hist = fetch_stock_history(ticker, start=start_date, end=end_date)
+            if hist is not None and not hist.empty:
+                start_prices.append(hist['Close'].iloc[0])
+                current_prices.append(hist['Close'].iloc[-1])
+            else:
+                start_prices.append(float('nan'))
+                current_prices.append(float('nan'))
+        portfolio_data.insert(2, 'Current Price', [f"${p:.2f}" if not pd.isna(p) else 'N/A' for p in current_prices])
+        portfolio_data.insert(3, 'Start of Period Price', [f"${p:.2f}" if not pd.isna(p) else 'N/A' for p in start_prices])
+        # Reorder columns for better display
+        display_cols = ['Ticker', 'Name', 'Current Price', 'Start of Period Price', 'Weight', 'Expected Return', 'Volatility', 'Change %', 'Market Cap', 'P/E Ratio', 'Beta']
+        portfolio_data = portfolio_data[display_cols]
+        st.dataframe(portfolio_data, use_container_width=True)
+        # Add subtle help text below the table (unchanged)
+        st.markdown('''
+        <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
+            <b>Expected Return:</b> Annualized return since start date (higher is better) • 
+            <b>Volatility:</b> Annualized standard deviation (lower is better) • 
+            <b>Change %:</b> Total percentage change since start date (higher is better)
+        </div>
+        ''', unsafe_allow_html=True)
+
+def create_portfolio_chart(tickers: List[str], timeframe: str):
+    """Create portfolio performance chart using the selected timeframe."""
+    # Convert timeframe to date range
+    end_date = datetime.today()
+    if timeframe == '1D':
+        start_date = end_date - timedelta(days=1)
+        interval = '1m'
+    elif timeframe == '5D':
+        start_date = end_date - timedelta(days=5)
+        interval = '5m'
+    elif timeframe == '1M':
+        start_date = end_date - timedelta(days=30)
+        interval = '1d'
+    elif timeframe == '6M':
+        start_date = end_date - timedelta(days=180)
+        interval = '1d'
+    elif timeframe == '1Y':
+        start_date = end_date - timedelta(days=365)
+        interval = '1d'
+    elif timeframe == 'YTD':
+        start_date = datetime(end_date.year, 1, 1)
+        interval = '1d'
+    elif timeframe == '5Y':
+        start_date = end_date - timedelta(days=5*365)
+        interval = '1wk'
+    else:  # 10Y
+        start_date = end_date - timedelta(days=10*365)
+        interval = '1mo'
+    with st.spinner(f"Loading chart data for {timeframe}..."):
+        fig = go.Figure()
+        # Use a qualitative palette for clear differentiation
+        palette = px.colors.qualitative.Set2 + px.colors.qualitative.Set3
+        for i, ticker in enumerate(tickers):
+            hist = fetch_stock_history(
+                ticker,
+                start=start_date,
+                end=end_date,
+                interval=interval
+            )
+            if hist is not None and not hist.empty:
+                normalized = (hist['Close'] / hist['Close'].iloc[0] - 1) * 100
+                fig.add_trace(go.Scatter(
+                    x=hist.index,
+                    y=normalized,
+                    mode='lines',
+                    name=ticker,
+                    line=dict(width=2, color=palette[i % len(palette)]),
+                    hovertemplate=f'<b>{ticker}</b><br>Date: %{{x}}<br>Change: %{{y:.2f}}%<extra></extra>'
+                ))
+        fig.update_layout(
+            title=f"Portfolio Performance - {timeframe} (%)",
+            xaxis_title="Date",
+            yaxis_title="Change (%)",
+            height=500,
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            hovermode='x unified',
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            )
         )
+        st.plotly_chart(fig, use_container_width=True)
 
-        if selected_ticker:
-            try:
-                # When a company is selected, preload all financial data and build year dictionaries before defining tabs
-                income_data = get_financial_data(selected_ticker, 'income')
-                balance_data = get_financial_data(selected_ticker, 'balance')
-                cashflow_data = get_financial_data(selected_ticker, 'cashflow')
-                # Helper to normalize index
-                def normalize_index(df):
-                    df = df.copy()
-                    df.index = [str(idx).lower() for idx in df.index]
-                    return df
-                # Helper to extract rows for a metric map
-                def extract_rows(data, metric_map, year_cols):
-                    rows = []
-                    for display_name, aliases in metric_map:
-                        found = False
-                        for alias in aliases:
-                            if alias in data.index:
-                                row = data.loc[alias, year_cols]
-                                found = True
-                                break
-                        if not found:
-                            row = [None] * len(year_cols)
-                        rows.append([display_name] + list(row))
-                    return rows
-                # Define year_cols for each statement
-                def get_year_cols(data):
-                    if data is None or data.empty:
-                        return []
-                    current_year = datetime.now().year
-                    years = list(range(current_year-1, current_year-5, -1))
-                    year_cols = []
-                    for col in data.columns:
-                        if isinstance(col, (pd.Timestamp, datetime)):
-                            if col.year in years:
-                                year_cols.append(col)
-                        elif str(col).isdigit() and int(col) in years:
-                            year_cols.append(col)
-                    year_cols.sort(reverse=True)
-                    return year_cols
-                # Metric maps
-                income_metric_map = [
-                    ("Total Revenue", ["total revenue", "totalrevenue"]),
-                    ("Cost of Revenue", ["cost of revenue", "cost of revenue", "costofrevenue"]),
-                    ("Gross Profit", ["gross profit", "grossprofit"]),
-                    ("Operating Income", ["operating income", "operatingincome"]),
-                    ("EBIT", ["ebit", "earnings before interest and taxes"]),
-                    ("EBITDA", ["ebitda"]),
-                    ("Total Expenses", ["total expenses", "totalexpenses"]),
-                    ("Diluted EPS", ["diluted eps", "dilutedeps"]),
-                    ("Net Income Common Stockholders", ["net income common stockholders", "net income", "netincome"])
-                ]
-                balance_metric_map = [
-                    ("Total Assets", ["total assets", "totalassets"]),
-                    ("Current Assets", ["current assets"]),
-                    ("Total Liabilities", ["total liabilities", "totalliabilities", "total liabilities net minority interest"]),
-                    ("Current Liabilities", ["current liabilities"]),
-                    ("Total Equity", ["total equity", "total stockholder equity", "totalequity", "totalstockholderequity", "total equity gross minority interest"]),
-                    ("Total Capitalization", ["total capitalization", "totalcapitalization"]),
-                    ("Net Tangible Assets", ["net tangible assets", "nettangibleassets"]),
-                    ("Working Capital", ["working capital", "workingcapital"]),
-                    ("Invested Capital", ["invested capital", "investedcapital"]),
-                    ("Total Debt", ["total debt", "totaldebt"]),
-                    ("Inventory", ["inventory"]),
-                    ("Net Receivables", ["net receivables", "accounts receivable", "accountsreceivable"])
-                ]
-                cashflow_metric_map = [
-                    ("Operating Cash Flow", ["operating cash flow", "total cash from operating activities", "net cash provided by operating activities"]),
-                    ("Investing Cash Flow", ["investing cash flow", "total cashflows from investing activities", "net cash used for investing activities"]),
-                    ("Financing Cash Flow", ["financing cash flow", "total cash from financing activities", "net cash provided by financing activities"]),
-                    ("End Cash Flow", ["end cash position", "cash at end of period", "cash and cash equivalents at end of year"]),
-                    ("Capital Expenditure", ["capital expenditure", "capital expenditures"]),
-                    ("Free Cash Flow", ["free cash flow"])
-                ]
-                # Normalize and extract
-                income_dict_by_year = {}
-                balance_dict_by_year = {}
-                cashflow_dict_by_year = {}
-                if income_data is not None and not income_data.empty:
-                    income_data = normalize_index(income_data)
-                    year_cols = get_year_cols(income_data)
-                    income_rows = extract_rows(income_data, income_metric_map, year_cols)
-                    for i, col in enumerate(year_cols):
-                        year = str(col.year) if hasattr(col, 'year') else str(col)
-                        income_dict_by_year[year] = {r[0]: r[i+1] for r in income_rows}
-                if balance_data is not None and not balance_data.empty:
-                    balance_data = normalize_index(balance_data)
-                    year_cols = get_year_cols(balance_data)
-                    balance_rows = extract_rows(balance_data, balance_metric_map, year_cols)
-                    for i, col in enumerate(year_cols):
-                        year = str(col.year) if hasattr(col, 'year') else str(col)
-                        balance_dict_by_year[year] = {r[0]: r[i+1] for r in balance_rows}
-                if cashflow_data is not None and not cashflow_data.empty:
-                    cashflow_data = normalize_index(cashflow_data)
-                    year_cols = get_year_cols(cashflow_data)
-                    cashflow_rows = extract_rows(cashflow_data, cashflow_metric_map, year_cols)
-                    for i, col in enumerate(year_cols):
-                        year = str(col.year) if hasattr(col, 'year') else str(col)
-                        cashflow_dict_by_year[year] = {r[0]: r[i+1] for r in cashflow_rows}
-                # Now define the tabs
-                fin_tabs = st.tabs(["Income Statement", "Balance Sheet", "Cash Flow", "Key Ratios"])
-
-                with fin_tabs[0]:
-                    st.subheader(f"{selected_ticker} Income Statement")
-                    if income_rows:
-                        formatted_data = pd.DataFrame(
-                            income_rows,
-                            columns=["Metric"] + [str(col.year) if hasattr(col, 'year') else str(col) for col in year_cols]
-                        )
-                        # Format values: currency for all except EPS (2 decimals)
-                        for idx, row in enumerate(formatted_data["Metric"]):
-                            if row == "Diluted EPS":
-                                formatted_data.iloc[idx, 1:] = formatted_data.iloc[idx, 1:].apply(lambda x: f"{x:,.2f}" if pd.notna(x) and x != None else 'N/A')
-                            else:
-                                formatted_data.iloc[idx, 1:] = formatted_data.iloc[idx, 1:].apply(lambda x: f"${x:,.0f}" if pd.notna(x) and x != None else 'N/A')
-                        st.dataframe(formatted_data, use_container_width=True)
-                        # --- Horizontal Analysis ---
-                        st.markdown("#### Horizontal Analysis (Year-over-Year % Change)")
-                        numeric_df = pd.DataFrame(income_rows, columns=["Metric"] + [str(col.year) if hasattr(col, 'year') else str(col) for col in year_cols])
-                        numeric_df = numeric_df.set_index("Metric")
-                        numeric_df = numeric_df.apply(pd.to_numeric, errors='coerce')
-                        horiz_years = [str(y) for y in sorted([int(c) for c in numeric_df.columns], reverse=True)[:3]]
-                        horiz_df = pd.DataFrame(index=numeric_df.index)
-                        for i, year in enumerate(horiz_years):
-                            prev_idx = numeric_df.columns.get_loc(year) + 1
-                            if prev_idx < len(numeric_df.columns):
-                                prev_year = numeric_df.columns[prev_idx]
-                                horiz_df[year] = [horizontal_analysis(numeric_df.loc[metric, prev_year], numeric_df.loc[metric, year]) for metric in numeric_df.index]
-                            else:
-                                horiz_df[year] = None
-                        horiz_df = horiz_df[horiz_years]
-                        horiz_df = horiz_df.applymap(lambda x: f"<span style='color:green'>{x:.2f}%</span>" if x is not None and x > 0 else (f"<span style='color:red'>{x:.2f}%</span>" if x is not None and x < 0 else 'N/A'))
-                        horiz_df = horiz_df.reset_index()
-                        st.write(horiz_df.to_html(escape=False, index=False), unsafe_allow_html=True)
-                        # --- Vertical Analysis ---
-                        st.markdown("#### Vertical Analysis (as % of Total Revenue)")
-                        if "Total Revenue" in numeric_df.index:
-                            total_revenue = numeric_df.loc["Total Revenue"]
-                            vert_df = numeric_df.divide(total_revenue, axis=1)
-                            vert_df = vert_df.applymap(lambda x: f"{x:.2%}" if pd.notna(x) else 'N/A')
-                            vert_df = vert_df.reset_index()
-                            st.dataframe(vert_df, use_container_width=True)
-                        else:
-                            st.warning("Could not find 'Total Revenue' for vertical analysis.")
-
-                with fin_tabs[1]:
-                    st.subheader(f"{selected_ticker} Balance Sheet")
-                    if balance_rows:
-                        formatted_data = pd.DataFrame(
-                            balance_rows,
-                            columns=["Metric"] + [str(col.year) if hasattr(col, 'year') else str(col) for col in year_cols]
-                        )
-                        for idx, row in enumerate(formatted_data["Metric"]):
-                            formatted_data.iloc[idx, 1:] = formatted_data.iloc[idx, 1:].apply(lambda x: f"${x:,.0f}" if pd.notna(x) and x != None else 'N/A')
-                        st.dataframe(formatted_data, use_container_width=True)
-                        # --- Horizontal Analysis ---
-                        st.markdown("#### Horizontal Analysis (Year-over-Year % Change)")
-                        numeric_df = pd.DataFrame(balance_rows, columns=["Metric"] + [str(col.year) if hasattr(col, 'year') else str(col) for col in year_cols])
-                        numeric_df = numeric_df.set_index("Metric")
-                        numeric_df = numeric_df.apply(pd.to_numeric, errors='coerce')
-                        horiz_years = [str(y) for y in sorted([int(c) for c in numeric_df.columns], reverse=True)[:3]]
-                        horiz_df = pd.DataFrame(index=numeric_df.index)
-                        for i, year in enumerate(horiz_years):
-                            prev_idx = numeric_df.columns.get_loc(year) + 1
-                            if prev_idx < len(numeric_df.columns):
-                                prev_year = numeric_df.columns[prev_idx]
-                                horiz_df[year] = [horizontal_analysis(numeric_df.loc[metric, prev_year], numeric_df.loc[metric, year]) for metric in numeric_df.index]
-                            else:
-                                horiz_df[year] = None
-                        horiz_df = horiz_df[horiz_years]
-                        horiz_df = horiz_df.applymap(lambda x: f"<span style='color:green'>{x:.2f}%</span>" if x is not None and x > 0 else (f"<span style='color:red'>{x:.2f}%</span>" if x is not None and x < 0 else 'N/A'))
-                        horiz_df = horiz_df.reset_index()
-                        st.write(horiz_df.to_html(escape=False, index=False), unsafe_allow_html=True)
-                        # --- Vertical Analysis ---
-                        st.markdown("#### Vertical Analysis (as % of Total Assets)")
-                        if "Total Assets" in numeric_df.index:
-                            total_assets = numeric_df.loc["Total Assets"]
-                            vert_df = numeric_df.divide(total_assets, axis=1)
-                            vert_df = vert_df.applymap(lambda x: f"{x:.2%}" if pd.notna(x) else 'N/A')
-                            vert_df = vert_df.reset_index()
-                            st.dataframe(vert_df, use_container_width=True)
-                        else:
-                            st.warning("Could not find 'Total Assets' for vertical analysis.")
-
-                with fin_tabs[2]:
-                    st.subheader(f"{selected_ticker} Cash Flow")
-                    if cashflow_rows:
-                        formatted_data = pd.DataFrame(
-                            cashflow_rows,
-                            columns=["Metric"] + [str(col.year) if hasattr(col, 'year') else str(col) for col in year_cols]
-                        )
-                        for idx, row in enumerate(formatted_data["Metric"]):
-                            formatted_data.iloc[idx, 1:] = formatted_data.iloc[idx, 1:].apply(lambda x: f"${x:,.0f}" if pd.notna(x) and x != None else 'N/A')
-                        st.dataframe(formatted_data, use_container_width=True)
-                        # --- Horizontal Analysis ---
-                        st.markdown("#### Horizontal Analysis (Year-over-Year % Change)")
-                        numeric_df = pd.DataFrame(cashflow_rows, columns=["Metric"] + [str(col.year) if hasattr(col, 'year') else str(col) for col in year_cols])
-                        numeric_df = numeric_df.set_index("Metric")
-                        numeric_df = numeric_df.apply(pd.to_numeric, errors='coerce')
-                        horiz_years = [str(y) for y in sorted([int(c) for c in numeric_df.columns], reverse=True)[:3]]
-                        horiz_df = pd.DataFrame(index=numeric_df.index)
-                        for i, year in enumerate(horiz_years):
-                            prev_idx = numeric_df.columns.get_loc(year) + 1
-                            if prev_idx < len(numeric_df.columns):
-                                prev_year = numeric_df.columns[prev_idx]
-                                horiz_df[year] = [horizontal_analysis(numeric_df.loc[metric, prev_year], numeric_df.loc[metric, year]) for metric in numeric_df.index]
-                            else:
-                                horiz_df[year] = None
-                        horiz_df = horiz_df[horiz_years]
-                        horiz_df = horiz_df.applymap(lambda x: f"<span style='color:green'>{x:.2f}%</span>" if x is not None and x > 0 else (f"<span style='color:red'>{x:.2f}%</span>" if x is not None and x < 0 else 'N/A'))
-                        horiz_df = horiz_df.reset_index()
-                        st.write(horiz_df.to_html(escape=False, index=False), unsafe_allow_html=True)
-                        # --- Vertical Analysis ---
-                        st.markdown("#### Vertical Analysis (as % of Operating Cash Flow)")
-                        op_cf_metric = None
-                        for op_cf_name in ["Operating Cash Flow", "Total Cash From Operating Activities", "Net Cash Provided By Operating Activities"]:
-                            if op_cf_name in numeric_df.index:
-                                op_cf_metric = numeric_df.loc[op_cf_name]
-                                break
-                        if op_cf_metric is not None:
-                            vert_df = numeric_df.divide(op_cf_metric, axis=1)
-                            vert_df = vert_df.applymap(lambda x: f"{x:.2%}" if pd.notna(x) else 'N/A')
-                            vert_df = vert_df.reset_index()
-                            st.dataframe(vert_df, use_container_width=True)
-                        else:
-                            st.warning("Could not find 'Operating Cash Flow' for vertical analysis.")
-
-                with fin_tabs[3]:
-                    st.subheader("📐 Key Financial Ratios")
-                    # Only show if we have at least one year of all statements
-                    if income_dict_by_year and balance_dict_by_year:
-                        ratio_matrix = {}
-                        for year in year_cols:
-                            year_str = str(year.year) if hasattr(year, 'year') else str(year)
-                            income = income_dict_by_year.get(year_str, {})
-                            balance = balance_dict_by_year.get(year_str, {})
-                            cash = cashflow_dict_by_year.get(year_str, {})
-                            def val(d, key):
-                                try:
-                                    return float(str(d.get(key, None)).replace(',', '').replace('$', ''))
-                                except:
-                                    return None
-                            # Extract correct values
-                            revenue = val(income, "Total Revenue")
-                            gross_profit = val(income, "Gross Profit")
-                            operating_income = val(income, "Operating Income")
-                            net_income = val(income, "Net Income Common Stockholders")
-                            cogs = val(income, "Cost of Revenue")
-                            total_assets = val(balance, "Total Assets")
-                            total_equity = val(balance, "Total Equity")
-                            current_assets = val(balance, "Current Assets")
-                            current_liabilities = val(balance, "Current Liabilities")
-                            inventory = val(balance, "Inventory")
-                            # Fallbacks if not available
-                            if current_assets is None:
-                                current_assets = total_assets
-                            if current_liabilities is None:
-                                current_liabilities = val(balance, "Total Liabilities")
-                            if inventory is None:
-                                inventory = val(balance, "Net Tangible Assets")
-                            # For efficiency ratios, need previous year for averages
-                            prev_year = str(int(year_str)-1)
-                            prev_balance = balance_dict_by_year.get(prev_year, {})
-                            avg_receivables = avg_inventory = avg_payables = None
-                            if prev_balance:
-                                ar = val(balance, "Net Receivables")
-                                prev_ar = val(prev_balance, "Net Receivables")
-                                if ar is not None and prev_ar is not None:
-                                    avg_receivables = (ar + prev_ar) / 2
-                                inv = inventory
-                                prev_inv = val(prev_balance, "Inventory")
-                                if inv is not None and prev_inv is not None:
-                                    avg_inventory = (inv + prev_inv) / 2
-                                ap = val(balance, "Total Liabilities")
-                                prev_ap = val(prev_balance, "Total Liabilities")
-                                if ap is not None and prev_ap is not None:
-                                    avg_payables = (ap + prev_ap) / 2
-                            purchases = cogs
-                            op_cf = val(cash, "Operating Cash Flow")
-                            # Compute ratios
-                            ratios = {
-                                "Current Ratio": current_ratio(current_assets, current_liabilities),
-                                "Quick Ratio": quick_ratio(current_assets, inventory, current_liabilities),
-                                "Working Capital": working_capital(current_assets, current_liabilities),
-                                "Gross Margin": gross_margin(gross_profit, revenue),
-                                "Operating Margin": operating_margin(operating_income, revenue),
-                                "Net Margin": net_margin(net_income, revenue),
-                                "ROA": return_on_assets(net_income, total_assets),
-                                "ROE": return_on_equity(net_income, total_equity),
-                                "DSO": dso(avg_receivables, revenue),
-                                "DPO": dpo(avg_payables, purchases),
-                                "DIO": dio(avg_inventory, cogs),
-                                "Cash Conversion Cycle": cash_conversion_cycle(
-                                    dso(avg_receivables, revenue),
-                                    dio(avg_inventory, cogs),
-                                    dpo(avg_payables, purchases)
-                                )
-                            }
-                            for k, v in ratios.items():
-                                if k not in ratio_matrix:
-                                    ratio_matrix[k] = {}
-                                if v is None:
-                                    display = 'N/A'
-                                elif 'Margin' in k or k in ["ROA", "ROE"]:
-                                    display = f"{v:.2%}"
-                                elif 'Working Capital' in k:
-                                    display = f"${v:,.0f}"
-                                else:
-                                    display = f"{v:.2f}"
-                                ratio_matrix[k][year_str] = display
-                        df = pd.DataFrame(ratio_matrix).T
-                        st.dataframe(df, use_container_width=True)
-                        
-                        # Add ratio insights
-                        st.markdown("### 🧠 Ratio Insights")
-                        
-                        # Parse numeric values from display strings
-                        parsed_ratios = {}
-                        for ratio_name, year_values in ratio_matrix.items():
-                            # Get the most recent year's value
-                            latest_year = max(year_values.keys())
-                            value = year_values[latest_year]
-                            try:
-                                if isinstance(value, str):
-                                    # Remove % and $ signs and convert to float
-                                    clean_value = value.replace('%', '').replace('$', '').replace(',', '')
-                                    parsed = float(clean_value) / (100 if '%' in value else 1)
-                                    parsed_ratios[ratio_name] = parsed
-                                elif isinstance(value, (int, float)):
-                                    parsed_ratios[ratio_name] = value
-                            except:
-                                parsed_ratios[ratio_name] = None
-                        
-                        insights = interpret_ratios(parsed_ratios)
-                        if insights:
-                            # Add legend
-                            st.markdown("""
-                            <div style="font-size: 14px; margin-bottom: 10px;">
-                                <span style="margin-right: 10px;">🟢 Best</span>
-                                <span style="margin-right: 10px;">🔵 Moderate</span>
-                                <span style="margin-right: 10px;">🔴 Concerning</span>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            
-                            # Display insights with markdown formatting
-                            for msg in insights:
-                                st.markdown(f"- {msg}", unsafe_allow_html=True)
-                        else:
-                            st.info("Not enough data to generate ratio insights.")
-                    else:
-                        st.info("Not enough data to compute ratios.")
-            except Exception as e:
-                st.error(f"Error fetching financial data for {selected_ticker}: {str(e)}")
-                st.expander("Error details").code(traceback.format_exc())
-
-# --- Market Overview Section ---
-if st.session_state.get('show_market_overview'):
-    st.markdown("## 🌎 Market Overview")
-    
-    # Add tooltip CSS
-    st.markdown("""
-    <style>
-        .tooltip {
-            position: relative;
-            display: inline-block;
-        }
-        .tooltip .tooltiptext {
-            visibility: hidden;
-            width: 260px;
-            background-color: #222;
-            color: #fff;
-            text-align: left;
-            border-radius: 6px;
-            padding: 8px 10px;
-            position: absolute;
-            z-index: 1;
-            bottom: 125%;
-            left: 50%;
-            margin-left: -130px;
-            opacity: 0;
-            transition: opacity 0.3s;
-            font-size: 0.9em;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-        }
-        .tooltip:hover .tooltiptext {
-            visibility: visible;
-            opacity: 1;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # Single timeframe selector for entire Market Overview
-    market_timeframe = st.selectbox(
-        "Select Timeframe",
-        ["5D", "1M", "1Y", "5Y", "10Y"],
-        index=0,
-        key="market_timeframe"
-    )
-    
-    # Map timeframe to yfinance parameters
-    timeframe_map = {
-        "5D": ("5d", "15m"),
-        "1M": ("1mo", "1d"),
-        "1Y": ("1y", "1wk"),
-        "5Y": ("5y", "1mo"),
-        "10Y": ("10y", "1mo")
-    }
-    
-    yfinance_period, yfinance_interval = timeframe_map[market_timeframe]
-
-    # ===== IMPROVED: Commodities & Forex =====
-    st.markdown("### 🌍 Commodities, Forex & Crypto")
-
-    # Add forex tooltip CSS
-    st.markdown("""
-    <style>
-        .forex-tooltip {
-            position: relative;
-            display: inline-block;
-            cursor: help;
-        }
-        .forex-tooltip .forex-tooltiptext {
-            visibility: hidden;
-            width: 260px;
-            background-color: #222;
-            color: #fff;
-            text-align: left;
-            border-radius: 6px;
-            padding: 8px 10px;
-            position: absolute;
-            z-index: 1;
-            bottom: 125%;
-            left: 50%;
-            margin-left: -130px;
-            opacity: 0;
-            transition: opacity 0.3s;
-            font-size: 0.9em;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-        }
-        .forex-tooltip:hover .forex-tooltiptext {
-            visibility: visible;
-            opacity: 1;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Define asset groups
-    commodities = {
-        "Gold": "GC=F",
-        "Crude Oil (WTI)": "CL=F",
-        "Silver": "SI=F",
-        "Natural Gas": "NG=F",
-        "Brent Crude": "BZ=F",
-        "Copper": "HG=F"
-    }
-
-    forex = {
-        "EUR/USD ℹ️": ("EURUSD=X", "For every 1 Euro you get {rate} US Dollars"),
-        "USD/JPY ℹ️": ("JPY=X", "For every 1 US Dollar you get {rate} Japanese Yen"),
-        "GBP/USD ℹ️": ("GBPUSD=X", "For every 1 British Pound you get {rate} US Dollars"),
-        "USD/CAD ℹ️": ("CAD=X", "For every 1 US Dollar you get {rate} Canadian Dollars"),
-        "AUD/USD ℹ️": ("AUDUSD=X", "For every 1 Australian Dollar you get {rate} US Dollars"),
-        "USD Index ℹ️": ("DX-Y.NYB", "Index of USD strength against basket of currencies")
-    }
-
-    crypto = {
-        "Bitcoin USD": "BTC-USD",
-        "Ethereum USD": "ETH-USD"
-    }
-
-    # Create tabs for different asset classes
-    tab1, tab2, tab3 = st.tabs(["⛽ Commodities", "💱 Forex", "₿ Crypto"])
+    # Additional features section - only show this at the bottom
+    st.subheader("Additional Features")
+    # Create tabs for additional features
+    tab1, tab2, tab3, tab4 = st.tabs(["Key Ticker Information", "Financials", "Monte Carlo Simulation", "Market Overview"])
 
     with tab1:
-        st.markdown("#### Commodities Performance")
-        cols = st.columns(len(commodities))
-        
-        for i, (name, ticker) in enumerate(commodities.items()):
-            with cols[i]:
-                with st.spinner(f"Loading {name} data..."):
-                    result = get_asset_price_change(ticker, period=yfinance_period)
-                    if result:
-                        current_price = result['current_price'].iloc[0] if hasattr(result['current_price'], 'iloc') else result['current_price']
-                        change = result['pct_change'].iloc[0] if hasattr(result['pct_change'], 'iloc') else result['pct_change']
-                        
-                        # Format price based on commodity type
-                        if "Oil" in name or "Gas" in name:
-                            price = f"${current_price:.2f}"
-                        elif name in ["Gold", "Silver"]:
-                            price = f"${current_price:.2f}/oz"
-                        else:
-                            price = f"${current_price:.2f}"
-                        
-                        # Determine color
-                        change_color = "red" if change < 0 else "green"
-                        
-                        # Create the metric with HTML/CSS
-                        st.markdown(f"""
-                        <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 5px;">{name}</div>
-                        <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">{price}</div>
-                        <div style="color: {change_color}; font-size: 1rem; margin: 5px 0;">{change:+.2f}%</div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.warning(f"⚠️ {name} data not available")
-                        st.caption(f"Symbol: {ticker}")
+        if st.session_state.get('portfolio_created', False):
+            tickers = st.session_state.get('portfolio_tickers', [])
+            st.subheader("Key Ticker Information")
+            tabs = st.tabs(tickers)
+            for tab, ticker in zip(tabs, tickers):
+                with tab:
+                    display_ticker_info(ticker)
 
     with tab2:
-        st.markdown("#### Forex Performance")
-        cols = st.columns(len(forex))
-        
-        for i, (name, (ticker, tooltip)) in enumerate(forex.items()):
-            with cols[i]:
-                with st.spinner(f"Loading {name} data..."):
-                    result = get_asset_price_change(ticker, period=yfinance_period)
-                    if result:
-                        current_price = result['current_price'].iloc[0] if hasattr(result['current_price'], 'iloc') else result['current_price']
-                        change = result['pct_change'].iloc[0] if hasattr(result['pct_change'], 'iloc') else result['pct_change']
-                        
-                        # Format the tooltip with current rate (max 4 decimals)
-                        formatted_rate = f"{current_price:.4f}" if "Index" not in name else f"{current_price:.2f}"
-                        formatted_tooltip = tooltip.format(rate=formatted_rate)
-                        
-                        # Special handling for USD Index
-                        if "Index" in name:
-                            price = f"{current_price:.2f}"
-                            formatted_tooltip += "<br><br>🔴 Above 100 = USD strong<br>🟢 Below 100 = USD weak"
-                        else:
-                            price = f"{current_price:.4f}"
-                        
-                        # Create the metric with tooltip
-                        st.markdown(f"""
-                        <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 5px;">
-                            {name.split('ℹ️')[0].strip()}
-                            <span class="tooltip">ℹ️
-                                <span class="tooltiptext">{formatted_tooltip}</span>
-                            </span>
-                        </div>
-                        <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">{price}</div>
-                        <div style="color: {'red' if change < 0 else 'green'}; font-size: 1rem; margin: 5px 0;">{change:+.2f}%</div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.warning(f"⚠️ {name} data not available")
-                        st.caption(f"Symbol: {ticker}")
-
+        if st.session_state.get('portfolio_created', False):
+            tickers = st.session_state.get('portfolio_tickers', [])
+            st.subheader("Financial Statements")
+            
+            # Define metric mappings for each statement type
+            income_metric_map = [
+                ("Total Revenue", ["total revenue", "totalrevenue"]),
+                ("Cost of Revenue", ["cost of revenue", "costofrevenue"]),
+                ("Gross Profit", ["gross profit", "grossprofit"]),
+                ("Operating Income", ["operating income", "operatingincome"]),
+                ("EBIT", ["ebit", "earnings before interest and taxes"]),
+                ("EBITDA", ["ebitda"]),
+                ("Total Expenses", ["total expenses", "totalexpenses"]),
+                ("Diluted EPS", ["diluted eps", "dilutedeps"]),
+                ("Net Income Common Stockholders", ["net income common stockholders", "net income", "netincome"])
+            ]
+            
+            balance_metric_map = [
+                ("Total Assets", ["total assets", "totalassets"]),
+                ("Current Assets", ["current assets"]),
+                ("Total Liabilities", ["total liabilities", "totalliabilities", "total liabilities net minority interest"]),
+                ("Current Liabilities", ["current liabilities"]),
+                ("Total Equity", ["total equity", "total stockholder equity", "totalequity", "totalstockholderequity", "total equity gross minority interest"]),
+                ("Total Capitalization", ["total capitalization", "totalcapitalization"]),
+                ("Net Tangible Assets", ["net tangible assets", "nettangibleassets"]),
+                ("Working Capital", ["working capital", "workingcapital"]),
+                ("Invested Capital", ["invested capital", "investedcapital"]),
+                ("Total Debt", ["total debt", "totaldebt"]),
+                ("Inventory", ["inventory"]),
+                ("Net Receivables", ["net receivables", "accounts receivable", "accountsreceivable"])
+            ]
+            
+            cashflow_metric_map = [
+                ("Operating Cash Flow", ["operating cash flow", "total cash from operating activities", "net cash provided by operating activities"]),
+                ("Investing Cash Flow", ["investing cash flow", "total cashflows from investing activities", "net cash used for investing activities"]),
+                ("Financing Cash Flow", ["financing cash flow", "total cash from financing activities", "net cash provided by financing activities"]),
+                ("End Cash Flow", ["end cash position", "cash at end of period", "cash and cash equivalents at end of year"]),
+                ("Capital Expenditure", ["capital expenditure", "capital expenditures"]),
+                ("Free Cash Flow", ["free cash flow"])
+            ]
+            
+            # Create tabs for each ticker
+            ticker_tabs = st.tabs(tickers)
+            
+            for ticker_tab, ticker in zip(ticker_tabs, tickers):
+                with ticker_tab:
+                    st.markdown(f"### {ticker} Financial Statements")
+                    
+                    # Create inner tabs for each statement type
+                    statement_tabs = st.tabs(["Income Statement", "Balance Sheet", "Cash Flow", "Key Ratios"])
+                    
+                    # Income Statement Tab
+                    with statement_tabs[0]:
+                        with st.spinner(f"Loading {ticker} Income Statement..."):
+                            income_stmt = fetch_financial_statement(ticker, "income", "Annual")
+                            if income_stmt is not None and not income_stmt.empty:
+                                # Initialize filtered_data with correct columns
+                                filtered_data = pd.DataFrame(columns=income_stmt.columns)
+                                for display_name, possible_keys in income_metric_map:
+                                    for key in possible_keys:
+                                        if key.lower() in [k.lower() for k in income_stmt.index]:
+                                            matching_key = next(k for k in income_stmt.index if k.lower() == key.lower())
+                                            filtered_data.loc[display_name] = income_stmt.loc[matching_key]
+                                            break
+                                
+                                if not filtered_data.empty:
+                                    display_financial_analysis(filtered_data, "income", "Total Revenue")
+                                else:
+                                    st.warning(f"No matching metrics found for {ticker} Income Statement")
+                            else:
+                                st.error(f"Could not fetch Income Statement for {ticker}")
+                    
+                    # Balance Sheet Tab
+                    with statement_tabs[1]:
+                        with st.spinner(f"Loading {ticker} Balance Sheet..."):
+                            balance_sheet = fetch_financial_statement(ticker, "balance", "Annual")
+                            if balance_sheet is not None and not balance_sheet.empty:
+                                # Initialize filtered_data with correct columns
+                                filtered_data = pd.DataFrame(columns=balance_sheet.columns)
+                                for display_name, possible_keys in balance_metric_map:
+                                    for key in possible_keys:
+                                        if key.lower() in [k.lower() for k in balance_sheet.index]:
+                                            matching_key = next(k for k in balance_sheet.index if k.lower() == key.lower())
+                                            filtered_data.loc[display_name] = balance_sheet.loc[matching_key]
+                                            break
+                                
+                                if not filtered_data.empty:
+                                    display_financial_analysis(filtered_data, "balance", "Total Assets")
+                                else:
+                                    st.warning(f"No matching metrics found for {ticker} Balance Sheet")
+                            else:
+                                st.error(f"Could not fetch Balance Sheet for {ticker}")
+                    
+                    # Cash Flow Tab
+                    with statement_tabs[2]:
+                        with st.spinner(f"Loading {ticker} Cash Flow Statement..."):
+                            cash_flow = fetch_financial_statement(ticker, "cashflow", "Annual")
+                            if cash_flow is not None and not cash_flow.empty:
+                                # Initialize filtered_data with correct columns
+                                filtered_data = pd.DataFrame(columns=cash_flow.columns)
+                                for display_name, possible_keys in cashflow_metric_map:
+                                    for key in possible_keys:
+                                        if key.lower() in [k.lower() for k in cash_flow.index]:
+                                            matching_key = next(k for k in cash_flow.index if k.lower() == key.lower())
+                                            filtered_data.loc[display_name] = cash_flow.loc[matching_key]
+                                            break
+                                
+                                if not filtered_data.empty:
+                                    display_financial_analysis(filtered_data, "cashflow", "Operating Cash Flow")
+                                else:
+                                    st.warning(f"No matching metrics found for {ticker} Cash Flow Statement")
+                            else:
+                                st.error(f"Could not fetch Cash Flow Statement for {ticker}")
+                    
+                    # Key Ratios Tab
+                    with statement_tabs[3]:
+                        with st.spinner(f"Calculating {ticker} Key Ratios..."):
+                            if all(df is not None and not df.empty for df in [income_stmt, balance_sheet, cash_flow]):
+                                display_financial_ratios(ticker, income_stmt, balance_sheet, cash_flow)
+                            else:
+                                st.warning(f"Could not calculate key ratios for {ticker}. Some financial statements are missing.")
     with tab3:
-        st.markdown("#### Cryptocurrency Performance")
-        cols = st.columns(len(crypto))
+        st.markdown("### Monte Carlo Simulation")
+        st.markdown("""
+        This Monte Carlo simulation projects potential future portfolio values based on:
+        - Your portfolio's historical return and volatility
+        - Random market fluctuations modeled with geometric Brownian motion
+
+        The simulation runs multiple possible scenarios to show the range of potential outcomes.
+        """)
         
-        for i, (name, ticker) in enumerate(crypto.items()):
-            with cols[i]:
-                with st.spinner(f"Loading {name} data..."):
-                    result = get_asset_price_change(ticker, period=yfinance_period)
-                    if result:
-                        current_price = result['current_price'].iloc[0] if hasattr(result['current_price'], 'iloc') else result['current_price']
-                        change = result['pct_change'].iloc[0] if hasattr(result['pct_change'], 'iloc') else result['pct_change']
-                        
-                        # Improved crypto price formatting
-                        if current_price >= 1000:
-                            price = f"${current_price:,.2f}"
-                        else:
-                            price = f"${current_price:,.2f}"
-                        
-                        # Create the metric with HTML/CSS
-                        st.markdown(f"""
-                        <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 5px;">{name}</div>
-                        <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">{price}</div>
-                        <div style="color: {'red' if change < 0 else 'green'}; font-size: 1rem; margin: 5px 0;">{change:+.2f}%</div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.warning(f"⚠️ {name} data not available")
-                        st.caption(f"Symbol: {ticker}")
+        # Get portfolio metrics from session state
+        start_date = st.session_state.get('start_date')
+        end_date = st.session_state.get('end_date')
+        risk_level = st.session_state.get('risk_level', 'Moderate')
+        
+        # Fetch historical data and calculate returns
+        returns_data = {}
+        for ticker in tickers:
+            hist = fetch_stock_history(ticker, start=start_date, end=end_date)
+            if hist is not None and not hist.empty:
+                returns_data[ticker] = hist['Close'].pct_change().dropna()
+        
+        if not returns_data:
+            st.error("Could not fetch historical data for simulation")
+            return
+            
+        returns_df = pd.DataFrame(returns_data)
+        
+        # Calculate annualized metrics
+        mean_returns = returns_df.mean() * 252
+        cov_matrix = returns_df.cov() * 252
+        
+        # Get weights based on risk level
+        if risk_level == "Custom":
+            custom_weights = st.session_state.get('custom_weights', {})
+            weights = np.array([custom_weights[ticker]/100.0 for ticker in tickers])
+        else:
+            weights = get_optimized_weights(mean_returns, cov_matrix, risk_level)
+        
+        # Calculate portfolio metrics
+        metrics = calculate_portfolio_metrics(returns_df, weights)
+        
+        if not metrics:
+            st.error("Could not calculate portfolio metrics for simulation")
+            return
+            
+        # Simulation parameters
+        col1, col2 = st.columns(2)
+        with col1:
+            start_value = st.number_input("Starting Portfolio Value ($)", 
+                                        min_value=1000, 
+                                        max_value=10000000, 
+                                        value=10000, 
+                                        step=1000)
+        with col2:
+            years = st.slider("Time Horizon (Years)", 
+                             min_value=1, 
+                             max_value=30, 
+                             value=10)
+        
+        simulations = st.slider("Number of Simulations", 
+                               min_value=100, 
+                               max_value=5000, 
+                               value=1000, 
+                               step=100)
+        
+        if st.button("Run Simulation", use_container_width=True):
+            with st.spinner("Running Monte Carlo simulation..."):
+                results = monte_carlo_simulation(
+                    start_value=start_value,
+                    mean_return=metrics['annual_return'],
+                    volatility=metrics['annual_vol'],
+                    years=years,
+                    simulations=simulations
+                )
+                
+                # Plot simulation paths
+                fig = go.Figure()
+                for i in range(min(100, simulations)):  # Plot max 100 paths for clarity
+                    fig.add_trace(go.Scatter(
+                        y=results[i],
+                        mode='lines',
+                        line=dict(width=1, color='rgba(100, 100, 255, 0.2)'),
+                        showlegend=False,
+                        hoverinfo='none'
+                    ))
+                
+                # Add percentiles
+                percentiles = np.percentile(results, [5, 50, 95], axis=0)
+                fig.add_trace(go.Scatter(
+                    y=percentiles[1],  # Median
+                    mode='lines',
+                    line=dict(width=3, color='blue'),
+                    name='Median',
+                    hovertemplate='Median: %{y:,.0f}<extra></extra>'
+                ))
+                fig.add_trace(go.Scatter(
+                    y=percentiles[0],  # 5th percentile
+                    mode='lines',
+                    line=dict(width=2, color='red', dash='dash'),
+                    name='5th Percentile',
+                    hovertemplate='Worst 5%%: %{y:,.0f}<extra></extra>'
+                ))
+                fig.add_trace(go.Scatter(
+                    y=percentiles[2],  # 95th percentile
+                    mode='lines',
+                    line=dict(width=2, color='green', dash='dash'),
+                    name='95th Percentile',
+                    hovertemplate='Best 5%%: %{y:,.0f}<extra></extra>'
+                ))
+                
+                fig.update_layout(
+                    title=f"Monte Carlo Simulation ({years} Years, {simulations} Runs)",
+                    xaxis_title="Time Steps",
+                    yaxis_title="Portfolio Value ($)",
+                    height=500,
+                    hovermode="x unified",
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    paper_bgcolor='rgba(0,0,0,0)'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Display key statistics
+                final_values = results[:, -1]
+                
+                def format_stats(value):
+                    change_pct = (value - start_value) / start_value * 100
+                    return f"${value:,.2f} ({change_pct:+.2f}%)"
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Median Final Value", 
+                            format_stats(np.median(final_values)),
+                            help="50th percentile outcome")
+                with col2:
+                    st.metric("5th Percentile (Worst Case)", 
+                            format_stats(np.percentile(final_values, 5)),
+                            help="Only 5% of outcomes will be worse than this")
+                with col3:
+                    st.metric("95th Percentile (Best Case)", 
+                            format_stats(np.percentile(final_values, 95)),
+                            help="Only 5% of outcomes will be better than this")
+                
+                # Histogram of final values
+                st.markdown("##### Final Value Distribution")
+                fig_hist = px.histogram(
+                    x=final_values,
+                    nbins=50,
+                    labels={'x': 'Final Portfolio Value ($)'},
+                    color_discrete_sequence=['blue']
+                )
+                fig_hist.update_layout(
+                    height=400,
+                    showlegend=False,
+                    xaxis_title="Final Portfolio Value",
+                    yaxis_title="Number of Simulations"
+                )
+                st.plotly_chart(fig_hist, use_container_width=True)
+    with tab4:
+        display_market_overview()
 
-    # --- Improved Market Snapshot Section ---
-    st.markdown("### 📊 Market Snapshot")
+def get_market_indicators() -> Dict[str, Dict[str, Union[float, str]]]:
+    """Fetch key market indicators including S&P 500, VIX, and Treasury yields"""
+    try:
+        indicators = {}
+        
+        # Fetch SPY data for S&P 500
+        spy_data = fetch_stock_history("SPY", period="1d")
+        if spy_data is not None and not spy_data.empty:
+            spy_close = spy_data['Close'].iloc[-1]
+            spy_change = ((spy_close - spy_data['Open'].iloc[0]) / spy_data['Open'].iloc[0]) * 100
+            indicators['S&P 500'] = {
+                'value': spy_close,
+                'change': spy_change,
+                'change_pct': f"{spy_change:+.2f}%",
+                'icon': "🟢" if spy_change >= 0 else "🔴"
+            }
+        
+        # Fetch VIX data
+        vix_data = fetch_stock_history("^VIX", period="1d")
+        if vix_data is not None and not vix_data.empty:
+            vix_close = vix_data['Close'].iloc[-1]
+            vix_change = ((vix_close - vix_data['Open'].iloc[0]) / vix_data['Open'].iloc[0]) * 100
+            indicators['VIX'] = {
+                'value': vix_close,
+                'change': vix_change,
+                'change_pct': f"{vix_change:+.2f}%",
+                'icon': "🔴" if vix_change >= 0 else "🟢"  # Inverse for VIX
+            }
+        
+        # Fetch 10Y Treasury Yield
+        treasury_data = fetch_stock_history("^TNX", period="1d")
+        if treasury_data is not None and not treasury_data.empty:
+            treasury_close = treasury_data['Close'].iloc[-1]
+            treasury_change = ((treasury_close - treasury_data['Open'].iloc[0]) / treasury_data['Open'].iloc[0]) * 100
+            indicators['10Y Yield'] = {
+                'value': treasury_close,
+                'change': treasury_change,
+                'change_pct': f"{treasury_change:+.2f}%",
+                'icon': "🟢" if treasury_change >= 0 else "🔴"
+            }
+        
+        return indicators
+        
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error fetching market indicators: {str(e)}")
+        return {}
+
+def create_metric_card(title, value, change, color):
+    return f"""
+    <div style="
+        background: linear-gradient(135deg, {color}22, {color}11);
+        border-left: 4px solid {color};
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 0.5rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    ">
+        <h4 style="margin: 0; color: {color};">{title}</h4>
+        <h2 style="margin: 0.5rem 0;">{value}</h2>
+        <p style="margin: 0; font-size: 0.9rem; color: {color};">{change}</p>
+    </div>
+    """
+
+def get_spy_status_icon_and_label(change_pct: float, timeframe: str) -> Tuple[str, str]:
+    """Determine SPY status icon and label based on performance and timeframe."""
+    if timeframe == "5D":
+        if change_pct >= 1.5:
+            return "🟢", "Bullish Week"
+        elif change_pct <= -1.5:
+            return "🔴", "Bearish Week"
+        else:
+            return "🟡", "Sideways"
+    elif timeframe == "1M":
+        if change_pct >= 3:
+            return "🟢", "Strong Rally"
+        elif change_pct <= -3:
+            return "🔴", "Down Month"
+        else:
+            return "🟡", "Neutral"
+    elif timeframe == "6M":  # Added 6M timeframe
+        if change_pct >= 10:
+            return "🟢", "Strong Rally"
+        elif change_pct <= -10:
+            return "🔴", "Downtrend"
+        else:
+            return "🟡", "Moderate"
+    elif timeframe == "YTD":  # Added YTD timeframe
+        if change_pct >= 15:
+            return "🟢", "Strong YTD"
+        elif change_pct <= -15:
+            return "🔴", "Weak YTD"
+        else:
+            return "🟡", "Neutral YTD"
+    elif timeframe == "1Y":
+        if change_pct >= 8:
+            return "🟢", "Strong Year"
+        elif change_pct <= -8:
+            return "🔴", "Bearish Year"
+        else:
+            return "🟡", "Flat Year"
+    elif timeframe == "5Y":
+        if change_pct >= 35:
+            return "🟢", "Strong Growth"
+        elif change_pct <= 5:
+            return "🔴", "Underperforming"
+        else:
+            return "🟡", "Moderate"
+    elif timeframe == "10Y":
+        if change_pct >= 80:
+            return "🟢", "Strong Decade"
+        elif change_pct <= 10:
+            return "🔴", "Weak Decade"
+        else:
+            return "🟡", "Flat Decade"
+    else:
+        return "ℹ️", "Normal" if change_pct >= 0 else "⚠️", "Caution"
+
+def fetch_data_for_timeframe(ticker: str, mo_period: Optional[str], mo_interval: str, market_tf: str) -> Optional[pd.DataFrame]:
+    """Fetch stock data with proper handling of YTD and other timeframes."""
+    if market_tf == "YTD":
+        current_year = datetime.today().year
+        start_date = datetime(current_year, 1, 1)
+        return fetch_stock_history(ticker, start=start_date, end=datetime.today(), interval=mo_interval)
+    else:
+        return fetch_stock_history(ticker, period=mo_period, interval=mo_interval)
+
+def display_market_overview():
+    st.markdown("## Market Overview")
+
+    # Timeframe selector - remove 1D option
+    market_tf = st.selectbox(
+        "Select Market Overview Timeframe",
+        options=["5D", "1M", "6M", "1Y", "YTD", "5Y", "10Y"],  # Removed "1D"
+        index=1,  # Default to 1M
+        key="market_overview_timeframe"
+    )
     
-    col1, col2, col3 = st.columns(3)
+    # Get period and interval
+    mo_period, mo_interval = get_period_from_timeframe(market_tf)
+    
+    # For YTD, we need to calculate the start date as Jan 1 of current year
+    if market_tf == "YTD":
+        current_year = datetime.today().year
+        start_date = datetime(current_year, 1, 1)
+        end_date = datetime.today()
+        # Override the period/interval for YTD to use date range
+        mo_period = None
+        mo_interval = "1d"
+    elif market_tf == "6M":
+        # For 6 months, ensure we're getting daily data
+        mo_period = "6mo"
+        mo_interval = "1d"
 
+    # Key indicators section
+    st.markdown("### Key Market Indicators")
+    col1, col2, col3 = st.columns(3)
+    
+    # --- SPY (S&P 500) ---
     with col1:
         # Dynamic tooltip content based on timeframe
         timeframe_tooltips = {
@@ -2620,6 +1422,18 @@ if st.session_state.get('show_market_overview'):
                 🟢 Strong Monthly Rally: +3% or more<br>
                 🔴 Down Month: -3% or less<br>
                 🟡 Neutral Month: Between thresholds
+            """,
+            "6M": """
+                <strong>S&P 500 (SPY) 6-Month Performance</strong><br>
+                🟢 Strong Rally: +10% or more<br>
+                🔴 Downtrend: -10% or less<br>
+                🟡 Moderate: Between thresholds
+            """,
+            "YTD": """
+                <strong>S&P 500 (SPY) Year-to-Date Performance</strong><br>
+                🟢 Strong YTD: +15% or more<br>
+                🔴 Weak YTD: -15% or less<br>
+                🟡 Neutral YTD: Between thresholds
             """,
             "1Y": """
                 <strong>S&P 500 (SPY) Yearly Performance</strong><br>
@@ -2645,32 +1459,31 @@ if st.session_state.get('show_market_overview'):
         <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 5px;">
             S&P 500 (SPY)
             <span class="tooltip">ℹ️
-                <span class="tooltiptext">{timeframe_tooltips.get(market_timeframe, "Performance metrics")}</span>
+                <span class="tooltiptext">{timeframe_tooltips.get(market_tf, "Performance metrics")}</span>
             </span>
         </div>
         """, unsafe_allow_html=True)
-        try:
-            spy_data = yf.download("SPY", period=yfinance_period, interval=yfinance_interval, progress=False)
-            if not spy_data.empty and 'Close' in spy_data.columns:
-                spy_close = float(spy_data['Close'].iloc[-1])
-                spy_change = ((spy_close - float(spy_data['Close'].iloc[0])) / float(spy_data['Close'].iloc[0])) * 100
-                
-                spy_icon, spy_sentiment = get_spy_status_icon_and_label(spy_change, market_timeframe)
-                change_color = "green" if spy_change > 0 else "red"
-                
-                st.markdown(f"""
-                <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">${spy_close:,.2f}</div>
-                <div style="color: {change_color}; font-size: 1rem; margin: 5px 0;">{spy_change:+.2f}%</div>
-                <div style="font-size: 1rem; margin: 5px 0;">
-                    <span style="margin-right: 5px;">{spy_icon}</span>
-                    {spy_sentiment}
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.warning("No SPY data available")
-        except Exception as e:
-            st.error(f"Error loading SPY data: {str(e)}")
+        
+        spy_data = fetch_data_for_timeframe("SPY", mo_period, mo_interval, market_tf)
+        if spy_data is not None and not spy_data.empty:
+            spy_close = spy_data['Close'].iloc[-1]
+            spy_change = ((spy_close - spy_data['Close'].iloc[0]) / spy_data['Close'].iloc[0]) * 100
+            
+            spy_icon, spy_sentiment = get_spy_status_icon_and_label(spy_change, market_tf)
+            change_color = "green" if spy_change > 0 else "red"
+            
+            st.markdown(f"""
+            <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">${spy_close:,.2f}</div>
+            <div style="color: {change_color}; font-size: 1rem; margin: 5px 0;">{spy_change:+.2f}%</div>
+            <div style="font-size: 1rem; margin: 5px 0;">
+                <span style="margin-right: 5px;">{spy_icon}</span>
+                {spy_sentiment}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.warning("No SPY data available")
 
+    # --- VIX ---
     with col2:
         st.markdown("""
         <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 5px;">
@@ -2685,38 +1498,37 @@ if st.session_state.get('show_market_overview'):
             </span>
         </div>
         """, unsafe_allow_html=True)
-        try:
-            vix_data = yf.download("^VIX", period=yfinance_period, interval=yfinance_interval, progress=False)
-            if not vix_data.empty and 'Close' in vix_data.columns:
-                vix_close = float(vix_data['Close'].iloc[-1])
-                vix_change = ((vix_close - float(vix_data['Close'].iloc[0])) / float(vix_data['Close'].iloc[0])) * 100
-                
-                if vix_close < 15:
-                    vix_indicator = "🟢"
-                    vix_status = "Low volatility"
-                    change_color = "green" if vix_change < 0 else "red"
-                elif 15 <= vix_close <= 25:
-                    vix_indicator = "🟡"
-                    vix_status = "Moderate volatility"
-                    change_color = "#daa520"
-                else:
-                    vix_indicator = "🔴"
-                    vix_status = "High volatility"
-                    change_color = "red" if vix_change > 0 else "green"
-                
-                st.markdown(f"""
-                <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">{vix_close:,.2f}</div>
-                <div style="color: {change_color}; font-size: 1rem; margin: 5px 0;">{vix_change:+.2f}%</div>
-                <div style="font-size: 1rem; margin: 5px 0;">
-                    <span style="margin-right: 5px;">{vix_indicator}</span>
-                    {vix_status}
-                </div>
-                """, unsafe_allow_html=True)
+        
+        vix_data = fetch_data_for_timeframe("^VIX", mo_period, mo_interval, market_tf)
+        if vix_data is not None and not vix_data.empty:
+            vix_close = vix_data['Close'].iloc[-1]
+            vix_change = ((vix_close - vix_data['Close'].iloc[0]) / vix_data['Close'].iloc[0]) * 100
+            
+            if vix_close < 15:
+                vix_indicator = "🟢"
+                vix_status = "Low volatility"
+                change_color = "green" if vix_change < 0 else "red"
+            elif 15 <= vix_close <= 25:
+                vix_indicator = "🟡"
+                vix_status = "Moderate volatility"
+                change_color = "#daa520"  # Gold color for moderate
             else:
-                st.warning("No VIX data available")
-        except Exception as e:
-            st.error(f"Error loading VIX data: {str(e)}")
+                vix_indicator = "🔴"
+                vix_status = "High volatility"
+                change_color = "red" if vix_change > 0 else "green"
+            
+            st.markdown(f"""
+            <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">{vix_close:,.2f}</div>
+            <div style="color: {change_color}; font-size: 1rem; margin: 5px 0;">{vix_change:+.2f}%</div>
+            <div style="font-size: 1rem; margin: 5px 0;">
+                <span style="margin-right: 5px;">{vix_indicator}</span>
+                {vix_status}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.warning("No VIX data available")
 
+    # --- 10-Year Treasury Yield ---
     with col3:
         st.markdown("""
         <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 5px;">
@@ -2731,132 +1543,1473 @@ if st.session_state.get('show_market_overview'):
             </span>
         </div>
         """, unsafe_allow_html=True)
-        try:
-            treasury_data = yf.download("^TNX", period=yfinance_period, interval=yfinance_interval, progress=False)
-            if not treasury_data.empty and 'Close' in treasury_data.columns:
-                yield_close = float(treasury_data['Close'].iloc[-1])
-                yield_change = ((yield_close - float(treasury_data['Close'].iloc[0])) / float(treasury_data['Close'].iloc[0])) * 100
-                
-                if yield_close < 3:
-                    yield_indicator = "🟢"
-                    yield_status = "Accommodative"
-                    change_color = "green" if yield_change < 0 else "red"
-                elif 3 <= yield_close <= 4:
-                    yield_indicator = "🟡"
-                    yield_status = "Neutral"
-                    change_color = "#daa520"
-                else:
-                    yield_indicator = "🔴"
-                    yield_status = "Restrictive"
-                    change_color = "red" if yield_change > 0 else "green"
-                
-                st.markdown(f"""
-                <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">{yield_close:,.2f}%</div>
-                <div style="color: {change_color}; font-size: 1rem; margin: 5px 0;">{yield_change:+.2f}%</div>
-                <div style="font-size: 1rem; margin: 5px 0;">
-                    <span style="margin-right: 5px;">{yield_indicator}</span>
-                    {yield_status}
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.warning("No yield data available")
-        except Exception as e:
-            st.error(f"Error loading yield data: {str(e)}")
-
-    # --- Improved Sector Performance Section ---
-    st.markdown("### 📊 Sector Performance")
-    
-    with st.spinner(f"Loading sector performance for {market_timeframe}..."):
-        try:
-            sector_perf = get_sector_performance_custom(market_timeframe)
+        
+        treasury_data = fetch_data_for_timeframe("^TNX", mo_period, mo_interval, market_tf)
+        if treasury_data is not None and not treasury_data.empty:
+            yield_close = treasury_data['Close'].iloc[-1]
+            yield_change = ((yield_close - treasury_data['Close'].iloc[0]) / treasury_data['Close'].iloc[0]) * 100
             
-            if sector_perf and len(sector_perf) > 0:
-                # Create two columns with adjusted ratio (3:1)
-                chart_col, table_col = st.columns([3, 1])
-                
-                with chart_col:
-                    # Filter out None values and invalid data
-                    valid_sectors = [(sector, perf) for sector, perf in sector_perf 
-                                    if perf is not None and isinstance(perf, Number)]
-                    
-                    if valid_sectors:
-                        # Sort by performance
-                        valid_sectors.sort(key=lambda x: x[1], reverse=True)
-                        
-                        fig = px.bar(
-                            x=[s[0] for s in valid_sectors],
-                            y=[s[1] for s in valid_sectors],
-                            color=[s[1] for s in valid_sectors],
-                            color_continuous_scale="RdYlGn",
-                            labels={"x": "", "y": "Return %"},
-                            title=f"Sector Performance ({market_timeframe})",
-                            height=450,
-                            width=700,
-                            text=[f"{s[1]:.1f}%" for s in valid_sectors]
-                        )
-                        fig.update_traces(
-                            textposition='outside',
-                            marker_line_color='rgba(0,0,0,0.5)',
-                            marker_line_width=1,
-                            textfont_size=12
-                        )
-                        fig.update_layout(
-                            yaxis_tickformat=".1f",
-                            margin=dict(l=20, r=20, t=40, b=20),
-                            showlegend=False,  # Removed legend
-                            xaxis_title=None,
-                            yaxis_title="Return %",
-                            plot_bgcolor='rgba(0,0,0,0)',
-                            paper_bgcolor='rgba(0,0,0,0)',
-                            font=dict(size=12),
-                            hoverlabel=dict(
-                                bgcolor="white",
-                                font_size=12,
-                                font_family="Arial"
-                            )
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.warning("No valid sector performance data available")
-                
-                with table_col:
-                    st.markdown("#### Performance Table")
-                    
-                    # Create dataframe with proper formatting
-                    sector_df = pd.DataFrame(
-                        [(s[0], f"{s[1]:.2f}%" if isinstance(s[1], Number) else "N/A") 
-                         for s in sector_perf],
-                        columns=["Sector", "Return %"]
-                    )
-                    
-                    # Style the dataframe based on performance
-                    def color_cells(val):
-                        try:
-                            num = float(val.replace('%', ''))
-                            color = 'green' if num > 0 else 'red'
-                            return f'color: {color}'
-                        except:
-                            return ''
-                    
-                    st.dataframe(
-                        sector_df.style.applymap(color_cells, subset=['Return %']),
-                        use_container_width=True,
-                        height=450,  # Match chart height
-                        hide_index=True
-                    )
+            if yield_close < 3:
+                yield_indicator = "🟢"
+                yield_status = "Accommodative"
+                change_color = "green" if yield_change < 0 else "red"
+            elif 3 <= yield_close <= 4:
+                yield_indicator = "🟡"
+                yield_status = "Neutral"
+                change_color = "#daa520"
             else:
-                st.warning("No sector performance data available")
+                yield_indicator = "🔴"
+                yield_status = "Restrictive"
+                change_color = "red" if yield_change > 0 else "green"
+            
+            st.markdown(f"""
+            <div style="font-size: 1.5rem; font-weight: bold; margin: 5px 0;">{yield_close:,.2f}%</div>
+            <div style="color: {change_color}; font-size: 1rem; margin: 5px 0;">{yield_change:+.2f}%</div>
+            <div style="font-size: 1rem; margin: 5px 0;">
+                <span style="margin-right: 5px;">{yield_indicator}</span>
+                {yield_status}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.warning("No yield data available")
+
+    # Rest of your existing market overview code (commodities, forex, crypto, sectors)
+    st.markdown("### Commodities, Forex & Crypto")
+    
+    commodities = {
+        "Gold": "GC=F",
+        "Crude Oil (WTI)": "CL=F",
+        "Silver": "SI=F",
+        "Natural Gas": "NG=F",
+        "Brent Crude": "BZ=F",
+        "Copper": "HG=F"
+    }
+
+    forex = {
+        "EUR/USD ℹ️": ("EURUSD=X", "For every 1 Euro you get {rate} US Dollars"),
+        "USD/JPY ℹ️": ("JPY=X", "For every 1 US Dollar you get {rate} Japanese Yen"),
+        "GBP/USD ℹ️": ("GBPUSD=X", "For every 1 British Pound you get {rate} US Dollars"),
+        "USD/CAD ℹ️": ("CAD=X", "For every 1 US Dollar you get {rate} Canadian Dollars"),
+        "AUD/USD ℹ️": ("AUDUSD=X", "For every 1 Australian Dollar you get {rate} US Dollars"),
+        "USD Index ℹ️": ("DX-Y.NYB", "Index of USD strength against basket of currencies")
+    }
+
+    crypto = {
+        "Bitcoin USD": "BTC-USD",
+        "Ethereum USD": "ETH-USD"
+    }
+
+    tab1, tab2, tab3 = st.tabs(["Commodities", "Forex", "Crypto"])
+
+    def render_assets(assets, is_forex=False):
+        cols = st.columns(len(assets))
+        for i, (name, data) in enumerate(assets.items()):
+            ticker = data if not is_forex else data[0]
+            tooltip = None if not is_forex else data[1]
+            with cols[i]:
+                with st.spinner(f"Loading {name}..."):
+                    result = get_asset_price_change(ticker, period=mo_period)
+                    if result:
+                        price = f"${result['current_price']:,.2f}" if "Index" not in name else f"{result['current_price']:.2f}"
+                        change = result['pct_change']
+                        color = "green" if change >= 0 else "red"
+                        tooltip_html = ""
+                        if is_forex:
+                            formatted_rate = f"{result['current_price']:.4f}" if "Index" not in name else f"{result['current_price']:.2f}"
+                            full_tooltip = tooltip.format(rate=formatted_rate)
+                            if "Index" in name:
+                                full_tooltip += "<br><br>🔴 Above 100 = USD strong<br>🟢 Below 100 = USD weak"
+                            tooltip_html = f'''<span class="tooltip">ℹ️
+                                <span class="tooltiptext">{full_tooltip}</span>
+                            </span>'''
+                            name = name.split("ℹ️")[0].strip()
+                        st.markdown(f'''
+                            <div style="font-weight:bold;">{name} {tooltip_html}</div>
+                            <div style="font-size:1.4rem;">{price}</div>
+                            <div style="color:{color};">{change:+.2f}%</div>
+                        ''', unsafe_allow_html=True)
+                    else:
+                        st.warning(f"⚠️ {name} data not available")
+
+    with tab1:
+        st.markdown("#### Commodities Performance")
+        render_assets(commodities)
+
+    with tab2:
+        st.markdown("#### Forex Performance")
+        render_assets(forex, is_forex=True)
+
+    with tab3:
+        st.markdown("#### Cryptocurrency Performance")
+        render_assets(crypto)
+
+    # --- Sector Performance ---
+    st.markdown("### Sector Performance")
+    with st.spinner("Loading sector performance..."):
+        sector_df = fetch_sector_performance()
+        if sector_df is not None and not sector_df.empty:
+            st.dataframe(sector_df, use_container_width=True)
+        else:
+            st.warning("No sector data available.")
+
+def calculate_portfolio_metrics(returns: pd.DataFrame, weights: np.ndarray) -> Dict[str, float]:
+    """Calculate key portfolio metrics"""
+    try:
+        # Portfolio returns
+        portfolio_returns = returns.dot(weights)
+        
+        # Annualized metrics
+        annual_return = portfolio_returns.mean() * 252
+        annual_vol = portfolio_returns.std() * np.sqrt(252)
+        sharpe_ratio = annual_return / annual_vol if annual_vol != 0 else 0
+        
+        # Maximum drawdown
+        cum_returns = (1 + portfolio_returns).cumprod()
+        rolling_max = cum_returns.expanding().max()
+        drawdowns = cum_returns / rolling_max - 1
+        max_drawdown = drawdowns.min()
+        
+        return {
+            'annual_return': annual_return,
+            'annual_vol': annual_vol,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown
+        }
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Error calculating portfolio metrics: {str(e)}")
+        return {}
+
+# Add this import and palette at the top (if not already present)
+import plotly.express as px
+custom_palette = px.colors.sequential.Blues + px.colors.sequential.Purples
+
+def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarray] = None):
+    """Display portfolio performance comparison with S&P 500 using selected date range"""
+    st.subheader("Portfolio vs. S&P 500 Benchmark")
+    
+    start_date = st.session_state.get('start_date')
+    end_date = st.session_state.get('end_date')
+    start_year = start_date.year if start_date else None
+    end_year = end_date.year if end_date else None
+    
+    with st.spinner("Loading benchmark comparison..."):
+        # Fetch portfolio data
+        portfolio_data = {}
+        for ticker in tickers:
+            hist = fetch_stock_history(
+                ticker,
+                start=start_date,
+                end=end_date
+            )
+            if hist is not None and not hist.empty:
+                portfolio_data[ticker] = hist['Close']
+        if not portfolio_data:
+            st.error("Could not fetch portfolio data")
+            return
+        # Create portfolio value series
+        portfolio_df = pd.DataFrame(portfolio_data)
+        if weights is None:
+            weights = np.array([1/len(tickers)] * len(tickers))  # Equal weights if not provided
+        portfolio_value = portfolio_df.dot(weights)
+        # Fetch SPY data
+        spy_data = fetch_stock_history(
+            "SPY",
+            start=start_date,
+            end=end_date
+        )
+        if spy_data is None or spy_data.empty:
+            st.error("Could not fetch S&P 500 data")
+            return
+        # Normalize both series to 100
+        portfolio_normalized = portfolio_value / portfolio_value.iloc[0] * 100
+        spy_normalized = spy_data['Close'] / spy_data['Close'].iloc[0] * 100
+        # --- Tabs for main chart and yearly breakdown ---
+        tab1, tab2 = st.tabs(["Performance Chart", "Yearly Performance Breakdown"])
+        with tab1:
+            # Create comparison chart
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=portfolio_normalized.index,
+                y=portfolio_normalized,
+                mode='lines',
+                name='Portfolio',
+                line=dict(color='blue')
+            ))
+            fig.add_trace(go.Scatter(
+                x=spy_normalized.index,
+                y=spy_normalized,
+                mode='lines',
+                name='S&P 500',
+                line=dict(color='gray', dash='dash')
+            ))
+            # Calculate date range for title
+            date_range = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+            fig.update_layout(
+                title=f'Portfolio vs. S&P 500 Performance ({date_range})',
+                xaxis_title='Date',
+                yaxis_title='Value (Normalized to 100)',
+                height=500,
+                showlegend=True
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        with tab2:
+            # Calculate annual returns for each ticker
+            annual_returns = []
+            for ticker in tickers:
+                hist = fetch_stock_history(
+                    ticker,
+                    start=start_date,
+                    end=end_date
+                )
+                if hist is not None and not hist.empty:
+                    hist = hist.resample('Y').last()
+                    for i in range(1, len(hist)):
+                        year = hist.index[i].year
+                        prev_price = hist['Close'].iloc[i-1]
+                        curr_price = hist['Close'].iloc[i]
+                        ret = (curr_price - prev_price) / prev_price * 100
+                        if (not start_year or year >= start_year) and (not end_year or year <= end_year):
+                            annual_returns.append({
+                                'Year': year,
+                                'Ticker': ticker,
+                                'Annual Return (%)': ret
+                            })
+            if annual_returns:
+                df_annual = pd.DataFrame(annual_returns)
+                df_annual = df_annual.sort_values(['Year', 'Ticker'])
+                # Add a color column for text based on value
+                df_annual['TextColor'] = df_annual['Annual Return (%)'].apply(lambda x: 'green' if x >= 0 else 'red')
+                fig = px.bar(
+                    df_annual,
+                    x='Year',
+                    y='Annual Return (%)',
+                    color='Ticker',
+                    barmode='group',
+                    color_discrete_sequence=px.colors.qualitative.Set3,  # Vibrant colors
+                    title='Yearly Performance Breakdown',
+                    hover_data={'Annual Return (%)': ':.2f%'},
+                    text='Annual Return (%)'
+                )
+                fig.update_traces(
+                    marker_line_color='rgba(0,0,0,0.2)',
+                    marker_line_width=1,
+                    opacity=0.8,
+                    texttemplate='%{text:.2f}%',
+                    textposition='outside',
+                )
+                # Set text color by value (green/red)
+                for i, d in enumerate(fig.data):
+                    # Get mask for this ticker
+                    mask = df_annual['Ticker'] == d.name
+                    colors = df_annual.loc[mask, 'TextColor'].tolist()
+                    d.textfont = dict(color=colors)
+                fig.update_layout(
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=12),
+                    title_font_size=16,
+                    xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
+                    yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Not enough data to display yearly performance breakdown.")
+
+def display_ticker_info(ticker: str):
+    """Display detailed information for a single ticker"""
+    info = fetch_stock_info(ticker)
+    if not info:
+        st.error(f"Could not fetch information for {ticker}")
+        return
+    
+    # Company Information
+    st.markdown("### Company Information")
+    # Reduce font size for company info using HTML/CSS
+    st.markdown("""
+    <style>
+    .company-info-metrics .element-container {font-size: 0.92em !important;}
+    </style>
+    """, unsafe_allow_html=True)
+    with st.container():
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Company Name", info.get('shortName', 'N/A'))
+            st.metric("CEO", info.get('companyOfficers', [{}])[0].get('name', 'N/A') if info.get('companyOfficers') else 'N/A')
+            st.metric("Employees", format_value(info.get('fullTimeEmployees', 0), prefix='', suffix='', decimals=0))
+        with col2:
+            st.metric("Sector", info.get('sector', 'N/A'))
+            st.metric("Industry", info.get('industry', 'N/A'))
+            st.metric("Headquarters", f"{info.get('city', 'N/A')}, {info.get('state', 'N/A')}")
+        # Add current stock price as a metric (spanning both columns)
+        st.metric("Current Stock Price", format_value(info.get('currentPrice', None)))
+    
+    # Historical Prices
+    st.markdown("### Historical Prices")
+    # Updated period labels
+    periods = {
+        '1 Month Ago': '1mo',
+        '6 Months Ago': '6mo',
+        '1 Year Ago': '1y',
+        '5 Years Ago': '5y'
+    }
+    price_data = []
+    for period_name, period in periods.items():
+        hist = fetch_stock_history(ticker, period=period)
+        if hist is not None and not hist.empty:
+            current_price = hist['Close'].iloc[-1]
+            start_price = hist['Close'].iloc[0]
+            change_pct = ((current_price - start_price) / start_price) * 100
+            price_data.append({
+                'Period': period_name,
+                'Price': format_value(start_price),
+                'Change': f"{change_pct:+.2f}%"
+            })
+    if price_data:
+        df = pd.DataFrame(price_data)
+        st.dataframe(df.style.set_properties(**{'font-size': '13px'}), use_container_width=True)
+    # 52 Week High/Low
+    st.markdown("### 52 Week Range")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("52 Week High", format_value(info.get('fiftyTwoWeekHigh')))
+    with col2:
+        st.metric("52 Week Low", format_value(info.get('fiftyTwoWeekLow')))
+
+def format_financial_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Simplify financial columns to just year labels (e.g., 2022) and sort descending.
+    
+    Args:
+        df: DataFrame with datetime or string column names
+        
+    Returns:
+        DataFrame with:
+        - Only columns with valid years included
+        - Columns sorted by year in descending order (newest to oldest)
+        - Column names simplified to just years (e.g., '2024' instead of '2024-09-30')
+    """
+    if df is None or df.empty:
+        return None
+
+    # Extract valid year mappings
+    year_cols = {}
+    for col in df.columns:
+        try:
+            if isinstance(col, (pd.Timestamp, datetime)):
+                # Check if this column has any non-null data
+                if not df[col].isna().all():
+                    year = col.year
+                    year_cols[col] = year
+            else:
+                # For string columns, try to extract year and check for data
+                if not df[col].isna().all():
+                    year_str = str(col).split("-")[0]
+                    if year_str.isdigit():
+                        year = int(year_str)
+                        year_cols[col] = year
+        except (ValueError, AttributeError):
+            continue
+
+    # Keep only columns with valid year mapping AND actual data
+    if not year_cols:
+        return None
+
+    # Sort by year descending and get the original column names
+    sorted_cols = sorted(year_cols.items(), key=lambda x: x[1], reverse=True)
+    sorted_original_cols = [col for col, year in sorted_cols]
+
+    # Rename columns to just years
+    df_sorted = df[sorted_original_cols].copy()
+    df_sorted.columns = [str(year_cols[col]) for col in sorted_original_cols]
+    
+    return df_sorted
+
+def calculate_horizontal_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate year-over-year percentage changes for each metric."""
+    if df is None or df.empty or len(df.columns) < 2:
+        return None
+    
+    # First, ensure columns are properly sorted by year (newest to oldest)
+    df_sorted = format_financial_columns(df)
+    if df_sorted is None or len(df_sorted.columns) < 2:
+        return None
+    
+    # Explicitly sort years in reverse order (newest to oldest)
+    years = sorted([int(col) for col in df_sorted.columns], reverse=True)
+    df_sorted = df_sorted[[str(year) for year in years]]
+    
+    # Calculate percentage changes only between consecutive years with data
+    pct_changes = pd.DataFrame(index=df_sorted.index)
+    
+    for i in range(len(df_sorted.columns)-1):
+        current_col = df_sorted.columns[i]  # Newer year
+        prev_col = df_sorted.columns[i+1]   # Older year
+        
+        # Only calculate if both years have non-null data
+        valid_rows = ~df_sorted[current_col].isna() & ~df_sorted[prev_col].isna()
+        if valid_rows.any():
+            changes = (df_sorted.loc[valid_rows, current_col] - df_sorted.loc[valid_rows, prev_col]) / df_sorted.loc[valid_rows, prev_col].abs() * 100
+            pct_changes.loc[valid_rows, current_col] = changes
+    
+    # Format with colors and arrows
+    def format_change(val):
+        if pd.isna(val):
+            return 'N/A'
+        color = 'green' if val > 0 else 'red'
+        arrow = '▲' if val > 0 else '▼'
+        return f'<span style="color: {color}">{arrow} {val:+.1f}%</span>'
+    
+    return pct_changes.applymap(format_change) if not pct_changes.empty else None
+
+def calculate_vertical_analysis(df: pd.DataFrame, base_metric: str, statement_type: str) -> pd.DataFrame:
+    """Calculate vertical analysis (percentages of base metric) for each year."""
+    if df is None or df.empty:
+        return None
+        
+    # Format and sort columns
+    df_sorted = format_financial_columns(df)
+    if df_sorted is None:
+        return None
+    
+    # Get base metric values - make lookup more flexible
+    base_values = None
+    possible_names = [base_metric.lower()]
+    
+    # Add alternative names based on statement type
+    if statement_type == "income":
+        possible_names.extend([
+            "revenue", "totalrevenue", "sales", "total sales", "total revenue",
+            "net sales", "net revenue", "gross sales", "gross revenue"
+        ])
+    elif statement_type == "balance":
+        possible_names.extend([
+            "totalassets", "total assets", "assets", "total current assets",
+            "total non-current assets", "total long-term assets"
+        ])
+    elif statement_type == "cashflow":
+        possible_names.extend([
+            "operating cash flow", "cash from operations", "net cash provided by operating activities",
+            "total cash from operating activities", "cash flow from operations"
+        ])
+    
+    # Try to find a matching metric
+    for idx in df_sorted.index:
+        idx_lower = str(idx).lower()
+        if any(name in idx_lower for name in possible_names):
+            base_values = df_sorted.loc[idx]
+            break
+    
+    if base_values is None:
+        return None
+    
+    # Calculate percentages
+    percentages = df_sorted.div(base_values) * 100
+    
+    # Format percentages
+    def format_percentage(val):
+        if pd.isna(val):
+            return 'N/A'
+        return f'{val:.1f}%'
+    
+    formatted_percentages = percentages.applymap(format_percentage)
+    return formatted_percentages
+
+def style_financial_analysis(df: pd.DataFrame, analysis_type: str) -> pd.DataFrame:
+    """Apply styling to financial analysis DataFrame."""
+    if df is None or df.empty:
+        return None
+    
+    # Define styles based on analysis type
+    if analysis_type == 'horizontal':
+        # Green for positive, red for negative
+        def style_horizontal(val):
+            if isinstance(val, str):
+                if '▲' in val:
+                    return 'background-color: rgba(0, 255, 0, 0.1); color: green'
+                elif '▼' in val:
+                    return 'background-color: rgba(255, 0, 0, 0.1); color: red'
+            return ''
+        return df.style.applymap(style_horizontal)
+    else:  # vertical
+        # Blue gradient based on value
+        def style_vertical(val):
+            if isinstance(val, str) and '%' in val:
+                try:
+                    num = float(val.replace('%', ''))
+                    # Normalize to 0-1 range for color intensity
+                    intensity = min(num / 100, 1)
+                    return f'background-color: rgba(0, 0, 255, {intensity * 0.1})'
+                except:
+                    pass
+            return ''
+        return df.style.applymap(style_vertical)
+
+def display_financial_analysis(df: pd.DataFrame, statement_type: str, base_metric: str):
+    """Display horizontal and vertical analysis for a financial statement."""
+    if df is None or df.empty:
+        st.warning("No data available for analysis")
+        return
+    
+    # Format the main data table
+    df_formatted = format_financial_columns(df)
+    if df_formatted is not None:
+        st.dataframe(df_formatted.style.format(lambda x: format_value(x) if pd.notnull(x) else 'N/A'))
+    
+    # Horizontal Analysis
+    st.markdown("### Horizontal Analysis")
+    horizontal_df = calculate_horizontal_analysis(df)
+    if horizontal_df is not None and not horizontal_df.empty:
+        if len(df.columns) < 2:
+            st.info("Horizontal analysis requires at least 2 years of data")
+        else:
+            styled_horizontal = style_financial_analysis(horizontal_df, 'horizontal')
+            st.markdown(styled_horizontal.to_html(escape=False), unsafe_allow_html=True)
+            st.markdown("""
+            <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
+                ▲ Green: Positive year-over-year change • ▼ Red: Negative year-over-year change • 
+                Columns show changes from previous year (e.g., 2024 shows change from 2023)
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("Not enough data for horizontal analysis")
+    
+    # Vertical Analysis
+    st.markdown("### Vertical Analysis")
+    vertical_df = calculate_vertical_analysis(df, base_metric, statement_type)
+    if vertical_df is not None and not vertical_df.empty:
+        styled_vertical = style_financial_analysis(vertical_df, 'vertical')
+        st.markdown(styled_vertical.to_html(escape=False), unsafe_allow_html=True)
+        st.markdown(f"""
+        <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
+            Values shown as percentage of {base_metric}
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.warning(f"Could not calculate vertical analysis. Base metric '{base_metric}' not found or insufficient data.")
+
+# Add helper functions for ratio calculations
+def current_ratio(current_assets, current_liabilities):
+    """Calculate current ratio with safe division."""
+    return current_assets / current_liabilities if current_liabilities else None
+
+def quick_ratio(current_assets, inventory, current_liabilities):
+    """Calculate quick ratio with safe division."""
+    return (current_assets - inventory) / current_liabilities if current_liabilities else None
+
+def working_capital(current_assets, current_liabilities):
+    """Calculate working capital with safe subtraction."""
+    return current_assets - current_liabilities if current_assets is not None and current_liabilities is not None else None
+
+def gross_margin(gross_profit, revenue):
+    """Calculate gross margin with safe division."""
+    return gross_profit / revenue if revenue else None
+
+def operating_margin(operating_income, revenue):
+    """Calculate operating margin with safe division."""
+    return operating_income / revenue if revenue else None
+
+def net_margin(net_income, revenue):
+    """Calculate net margin with safe division."""
+    return net_income / revenue if revenue else None
+
+def return_on_assets(net_income, total_assets):
+    """Calculate ROA with safe division."""
+    return net_income / total_assets if total_assets else None
+
+def return_on_equity(net_income, equity):
+    """Calculate ROE with safe division."""
+    return net_income / equity if equity else None
+
+def dso(avg_receivables, revenue):
+    """Calculate Days Sales Outstanding with safe division."""
+    return (avg_receivables / revenue) * 365 if avg_receivables is not None and revenue else None
+
+def dpo(avg_payables, purchases):
+    """Calculate Days Payable Outstanding with safe division."""
+    return (avg_payables / purchases) * 365 if avg_payables is not None and purchases else None
+
+def dio(avg_inventory, cogs):
+    """Calculate Days Inventory Outstanding with safe division."""
+    return (avg_inventory / cogs) * 365 if avg_inventory is not None and cogs else None
+
+def cash_conversion_cycle(dso_val, dio_val, dpo_val):
+    """Calculate Cash Conversion Cycle with safe addition/subtraction."""
+    if dso_val is not None and dio_val is not None and dpo_val is not None:
+        return dso_val + dio_val - dpo_val
+    return None
+
+def calculate_financial_ratios(income_stmt: pd.DataFrame, balance_sheet: pd.DataFrame, cash_flow: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Calculate key financial ratios from financial statements with improved accuracy."""
+    if any(df is None or df.empty for df in [income_stmt, balance_sheet, cash_flow]):
+        return None
+        
+    # Format and sort all statements by year
+    income_stmt = format_financial_columns(income_stmt)
+    balance_sheet = format_financial_columns(balance_sheet)
+    cash_flow = format_financial_columns(cash_flow)
+    
+    if any(df is None for df in [income_stmt, balance_sheet, cash_flow]):
+        return None
+    
+    # Get common years across all statements
+    years = sorted(list(set(income_stmt.columns) & set(balance_sheet.columns) & set(cash_flow.columns)), reverse=True)
+    if not years:
+        return None
+    
+    # Initialize ratio DataFrames
+    liquidity_ratios = pd.DataFrame(index=['Current Ratio', 'Quick Ratio', 'Working Capital'], columns=years)
+    profitability_ratios = pd.DataFrame(index=['Gross Margin', 'Operating Margin', 'Net Margin', 'ROA', 'ROE'], columns=years)
+    efficiency_ratios = pd.DataFrame(index=['DSO', 'DPO', 'DIO', 'Cash Conversion Cycle'], columns=years)
+    leverage_ratios = pd.DataFrame(index=['Debt/Equity', 'Debt/Assets'], columns=years)
+    
+    # Helper function to safely get values with multiple fallback options
+    def get_value(df: pd.DataFrame, primary_name: str, fallback_names: List[str], year: str) -> float:
+        """Get value with multiple fallback options and proper error handling."""
+        names_to_try = [primary_name] + fallback_names
+        for name in names_to_try:
+            try:
+                # Exact match
+                if name in df.index:
+                    return df.loc[name, year]
                 
+                # Case-insensitive partial match
+                matches = [idx for idx in df.index if str(name).lower() in str(idx).lower()]
+                if matches:
+                    return df.loc[matches[0], year]
+            except:
+                continue
+        return None
+    
+    # Calculate ratios for each year
+    for i, year in enumerate(years):
+        try:
+            # Get key values with comprehensive fallback options
+            current_assets = get_value(balance_sheet, 'Total Current Assets', 
+                                     ['Current Assets'], year)
+            current_liabilities = get_value(balance_sheet, 'Total Current Liabilities',
+                                          ['Current Liabilities'], year)
+            inventory = get_value(balance_sheet, 'Inventory',
+                                ['Inventories'], year)
+            total_assets = get_value(balance_sheet, 'Total Assets', [], year)
+            total_equity = get_value(balance_sheet, "Total Stockholder Equity",
+                                   ['Total Equity', 'Stockholders Equity'], year)
+            total_debt = get_value(balance_sheet, 'Total Debt',
+                                 ['Long Term Debt', 'Debt'], year)
+            
+            revenue = get_value(income_stmt, 'Total Revenue',
+                              ['Revenue', 'Sales', 'Net Sales'], year)
+            gross_profit = get_value(income_stmt, 'Gross Profit',
+                                   ['Gross Income'], year)
+            operating_income = get_value(income_stmt, 'Operating Income',
+                                       ['Operating Profit'], year)
+            net_income = get_value(income_stmt, 'Net Income',
+                                 ['Net Earnings', 'Profit'], year)
+            cogs = get_value(income_stmt, 'Cost Of Revenue',
+                           ['Cost of Goods Sold', 'COGS'], year)
+            
+            # Get efficiency metrics - try to get average if possible
+            receivables = get_value(balance_sheet, 'Accounts Receivable',
+                                  ['Receivables', 'Net Receivables'], year)
+            payables = get_value(balance_sheet, 'Accounts Payable',
+                               ['Payables'], year)
+            
+            # Calculate Liquidity Ratios (safely handle division by zero)
+            liquidity_ratios.loc['Current Ratio', year] = (
+                current_assets / current_liabilities if current_liabilities and current_liabilities != 0 else None
+            )
+            liquidity_ratios.loc['Quick Ratio', year] = (
+                (current_assets - inventory) / current_liabilities 
+                if current_liabilities and current_liabilities != 0 else None
+            )
+            liquidity_ratios.loc['Working Capital', year] = (
+                current_assets - current_liabilities 
+                if current_assets is not None and current_liabilities is not None else None
+            )
+            
+            # Calculate Profitability Ratios
+            profitability_ratios.loc['Gross Margin', year] = (
+                gross_profit / revenue if revenue and revenue != 0 else None
+            )
+            profitability_ratios.loc['Operating Margin', year] = (
+                operating_income / revenue if revenue and revenue != 0 else None
+            )
+            profitability_ratios.loc['Net Margin', year] = (
+                net_income / revenue if revenue and revenue != 0 else None
+            )
+            profitability_ratios.loc['ROA', year] = (
+                net_income / total_assets if total_assets and total_assets != 0 else None
+            )
+            profitability_ratios.loc['ROE', year] = (
+                net_income / total_equity if total_equity and total_equity != 0 else None
+            )
+            
+            # Calculate Efficiency Ratios (using more accurate formulas)
+            # For DSO: Accounts Receivable / (Revenue/365)
+            dso_val = (
+                (receivables / (revenue / 365)) 
+                if revenue and revenue != 0 and receivables is not None else None
+            )
+            
+            # For DPO: Accounts Payable / (COGS/365)
+            dpo_val = (
+                (payables / (cogs / 365)) 
+                if cogs and cogs != 0 and payables is not None else None
+            )
+            
+            # For DIO: Inventory / (COGS/365)
+            dio_val = (
+                (inventory / (cogs / 365)) 
+                if cogs and cogs != 0 and inventory is not None else None
+            )
+            
+            efficiency_ratios.loc['DSO', year] = dso_val
+            efficiency_ratios.loc['DPO', year] = dpo_val
+            efficiency_ratios.loc['DIO', year] = dio_val
+            efficiency_ratios.loc['Cash Conversion Cycle', year] = (
+                dso_val + dio_val - dpo_val 
+                if None not in [dso_val, dio_val, dpo_val] else None
+            )
+            
+            # Calculate Leverage Ratios
+            leverage_ratios.loc['Debt/Equity', year] = (
+                total_debt / total_equity if total_equity and total_equity != 0 else None
+            )
+            leverage_ratios.loc['Debt/Assets', year] = (
+                total_debt / total_assets if total_assets and total_assets != 0 else None
+            )
+            
         except Exception as e:
-            st.error(f"Failed to load sector performance: {str(e)}")
-            st.error(traceback.format_exc())
+            if st.session_state.get('debug_mode', False):
+                st.error(f"Error calculating ratios for {year}: {str(e)}")
+            continue
+    
+    # Format the ratios
+    def format_ratio(val, ratio_type: str) -> str:
+        if pd.isna(val) or val is None:
+            return 'N/A'
+        if ratio_type == 'currency':
+            return format_value(val)
+        elif ratio_type == 'percentage':
+            return f"{val * 100:.1f}%"
+        elif ratio_type == 'days':
+            return f"{val:.1f} days"
+        else:  # decimal
+            return f"{val:.2f}"
+    
+    # Apply formatting
+    liquidity_ratios = liquidity_ratios.applymap(
+        lambda x: format_ratio(x, 'decimal' if x != 'Working Capital' else 'currency')
+    )
+    profitability_ratios = profitability_ratios.applymap(
+        lambda x: format_ratio(x, 'percentage')
+    )
+    efficiency_ratios = efficiency_ratios.applymap(
+        lambda x: format_ratio(x, 'days')
+    )
+    leverage_ratios = leverage_ratios.applymap(
+        lambda x: format_ratio(x, 'decimal')
+    )
+    
+    return {
+        'liquidity': liquidity_ratios,
+        'profitability': profitability_ratios,
+        'efficiency': efficiency_ratios,
+        'leverage': leverage_ratios
+    }
 
-    # Add debug mode toggle in the Market Overview section
-    if st.session_state.get('show_market_overview'):
-        # Add debug mode toggle at the top
-        debug_col, _ = st.columns([1, 5])
-        with debug_col:
-            st.session_state['debug_mode'] = st.checkbox("Debug Mode", value=False)
+def display_financial_ratios(ticker: str, income_stmt: pd.DataFrame, balance_sheet: pd.DataFrame, cash_flow: pd.DataFrame):
+    """Display key financial ratios in a tabular format."""
+    ratios = calculate_financial_ratios(income_stmt, balance_sheet, cash_flow)
+    if ratios is None:
+        st.warning(f"Could not calculate financial ratios for {ticker}. Insufficient data.")
+        return
+    
+    # Display each ratio category
+    st.markdown("### Liquidity Ratios")
+    st.dataframe(ratios['liquidity'], use_container_width=True)
+    st.markdown("""
+    <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
+        Current Ratio = Current Assets / Current Liabilities • 
+        Quick Ratio = (Current Assets - Inventory) / Current Liabilities • 
+        Working Capital = Current Assets - Current Liabilities
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("### Profitability Ratios")
+    st.dataframe(ratios['profitability'], use_container_width=True)
+    st.markdown("""
+    <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
+        Margins = Respective Income / Revenue • 
+        ROA = Net Income / Total Assets • 
+        ROE = Net Income / Total Equity
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("### Efficiency Ratios")
+    st.dataframe(ratios['efficiency'], use_container_width=True)
+    st.markdown("""
+    <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
+        DSO = Accounts Receivable / (Revenue/365) • 
+        DPO = Accounts Payable / (COGS/365) • 
+        DIO = Inventory / (COGS/365) • 
+        Cash Conversion Cycle = DSO + DIO - DPO
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("### Leverage Ratios")
+    st.dataframe(ratios['leverage'], use_container_width=True)
+    st.markdown("""
+    <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
+        Debt/Equity = Total Debt / Total Equity • 
+        Debt/Assets = Total Debt / Total Assets
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Add ratio insights analysis
+    if ratios:
+        # Get the most recent year available
+        latest_year = next(iter(ratios['liquidity'].columns), None)
+        if latest_year:
+            display_ratio_insights(ratios, latest_year)
 
-if not st.session_state.get('portfolio_created'):
-    st.info("Enter tickers and click Apply to view your portfolio dashboard.")
+def display_ratio_insights(ratios: dict, year: str):
+    """Display actionable insights for financial ratios using Streamlit components."""
+    
+    def fmt(value, is_percent=False):
+        """Format values consistently."""
+        if pd.isna(value) or value is None:
+            return "N/A"
+        if is_percent:
+            return f"{value*100:.1f}%"
+        return f"{value:.1f}"
+    
+    insights = []
+    
+    # Get the most recent year's ratios
+    latest_ratios = {}
+    for ratio_type, df in ratios.items():
+        if year in df.columns:
+            for ratio_name in df.index:
+                try:
+                    # Convert string values back to numbers if needed
+                    val_str = df.loc[ratio_name, year]
+                    if isinstance(val_str, str):
+                        if '%' in val_str:
+                            val = float(val_str.replace('%', '')) / 100
+                        elif 'days' in val_str:
+                            val = float(val_str.replace(' days', ''))
+                        else:
+                            val = float(val_str)
+                    else:
+                        val = val_str
+                    latest_ratios[ratio_name] = val
+                except:
+                    continue
+    
+    if not latest_ratios:
+        st.warning("No ratio data available for insights")
+        return
+    
+    st.markdown("---")
+    st.subheader("Ratio Insights & Analysis")
+    st.caption(f"Interpretation of {year} financial ratios with industry benchmarks")
+    
+    # Create expandable sections for each category
+    with st.expander("Liquidity Analysis", expanded=True):
+        cols = st.columns(3)
+        
+        # Current Ratio
+        cr = latest_ratios.get("Current Ratio")
+        with cols[0]:
+            st.metric("Current Ratio", 
+                     fmt(cr) if cr is not None else "N/A",
+                     help="Current assets / current liabilities")
+            if cr is not None:
+                if cr < 1:
+                    st.error("🔴 <1: May struggle to meet obligations (Ideal range: 1.5-3)")
+                elif cr > 3:
+                    st.warning("🟡 >3: Possible excess idle assets")
+                else:
+                    st.success("🟢 Healthy (1-3)")
+        
+        # Quick Ratio
+        qr = latest_ratios.get("Quick Ratio")
+        with cols[1]:
+            st.metric("Quick Ratio", 
+                     fmt(qr) if qr is not None else "N/A",
+                     help="(Current assets - inventory) / current liabilities")
+            if qr is not None:
+                if qr < 1:
+                    st.error("🔴 <1: Liquidity concern without inventory")
+                elif qr < 2:
+                    st.warning("🟡 Moderate (1-2)")
+                else:
+                    st.success("🟢 Strong (>2)")
+        
+        # Working Capital
+        wc = latest_ratios.get("Working Capital")
+        with cols[2]:
+            st.metric("Working Capital", 
+                     fmt(wc) if wc is not None else "N/A",
+                     help="Current assets - current liabilities")
+            if wc is not None:
+                if wc < 0:
+                    st.error("🔴 Negative: Liquidity risk")
+                else:
+                    st.success("🟢 Positive: Solvency OK")
+    
+    with st.expander("Profitability Analysis", expanded=True):
+        cols = st.columns(5)
+        
+        # Gross Margin
+        gm = latest_ratios.get("Gross Margin")
+        with cols[0]:
+            st.metric("Gross Margin", 
+                     fmt(gm, True) if gm is not None else "N/A",
+                     help="Gross profit / revenue")
+            if gm is not None:
+                if gm < 0.2:
+                    st.error("🔴 <20%: High costs (Target: >40%)")
+                elif gm < 0.4:
+                    st.warning("🟡 Moderate (20-40%)")
+                else:
+                    st.success("🟢 Strong (>40%)")
+        
+        # Operating Margin
+        om = latest_ratios.get("Operating Margin")
+        with cols[1]:
+            st.metric("Operating Margin", 
+                     fmt(om, True) if om is not None else "N/A",
+                     help="Operating income / revenue")
+            if om is not None:
+                if om < 0.1:
+                    st.error("🔴 <10%: Heavy ops costs (Target: >20%)")
+                elif om < 0.2:
+                    st.warning("🟡 Moderate (10-20%)")
+                else:
+                    st.success("🟢 Healthy (>20%)")
+        
+        # Net Margin
+        nm = latest_ratios.get("Net Margin")
+        with cols[2]:
+            st.metric("Net Margin", 
+                     fmt(nm, True) if nm is not None else "N/A",
+                     help="Net income / revenue")
+            if nm is not None:
+                if nm < 0:
+                    st.error("🔴 Negative: Unprofitable (Target: >20%)")
+                elif nm > 0.2:
+                    st.success("🟢 Excellent (>20%)")
+                else:
+                    st.warning("🟡 Moderate (0-20%)")
+        
+        # ROA
+        roa = latest_ratios.get("ROA")
+        with cols[3]:
+            st.metric("ROA", 
+                     fmt(roa, True) if roa is not None else "N/A",
+                     help="Net income / total assets")
+            if roa is not None:
+                if roa < 0:
+                    st.error("🔴 Negative: Asset misuse (Target: >10%)")
+                elif roa > 0.1:
+                    st.success("🟢 Strong (>10%)")
+                else:
+                    st.warning("🟡 Average (0-10%)")
+        
+        # ROE
+        roe = latest_ratios.get("ROE")
+        with cols[4]:
+            st.metric("ROE", 
+                     fmt(roe, True) if roe is not None else "N/A",
+                     help="Net income / total equity")
+            if roe is not None:
+                if roe < 0:
+                    st.error("🔴 Negative: Equity erosion (Target: >15%)")
+                elif roe > 0.15:
+                    st.success("🟢 High (>15%)")
+                else:
+                    st.warning("🟡 Average (0-15%)")
+    
+    with st.expander("Efficiency Analysis", expanded=True):
+        cols = st.columns(4)
+        
+        # DSO
+        dso = latest_ratios.get("DSO")
+        with cols[0]:
+            st.metric("DSO", 
+                     fmt(dso) if dso is not None else "N/A",
+                     help="Days Sales Outstanding")
+            if dso is not None:
+                if dso > 60:
+                    st.error("🔴 >60: Slow collections (Target: <30)")
+                elif dso < 30:
+                    st.success("🟢 <30: Fast payments")
+                else:
+                    st.warning("🟡 Average (30-60)")
+        
+        # DPO
+        dpo = latest_ratios.get("DPO")
+        with cols[1]:
+            st.metric("DPO", 
+                     fmt(dpo) if dpo is not None else "N/A",
+                     help="Days Payable Outstanding")
+            if dpo is not None:
+                if dpo > 90:
+                    st.success("🟢 >90: Good credit terms")
+                elif dpo < 30:
+                    st.error("🔴 <30: Short payment terms (Target: 30-90)")
+                else:
+                    st.warning("🟡 Normal (30-90)")
+        
+        # DIO
+        dio = latest_ratios.get("DIO")
+        with cols[2]:
+            st.metric("DIO", 
+                     fmt(dio) if dio is not None else "N/A",
+                     help="Days Inventory Outstanding")
+            if dio is not None:
+                if dio > 90:
+                    st.error("🔴 >90: Slow turnover (Target: <30)")
+                elif dio < 30:
+                    st.success("🟢 <30: Fast turnover")
+                else:
+                    st.warning("🟡 Average (30-90)")
+        
+        # CCC
+        ccc = latest_ratios.get("Cash Conversion Cycle")
+        with cols[3]:
+            st.metric("CCC", 
+                     fmt(ccc) if ccc is not None else "N/A",
+                     help="Cash Conversion Cycle")
+            if ccc is not None:
+                if ccc < 0:
+                    st.success("🟢 Negative: Very efficient")
+                elif ccc < 60:
+                    st.warning("🟡 Reasonable (<60)")
+                else:
+                    st.error("🔴 >60: Slow conversion (Target: <60)")
+    
+    # Leverage Analysis
+    with st.expander("🏗️ Leverage Analysis", expanded=True):
+        cols = st.columns(2)
+        
+        # Debt/Equity
+        de = latest_ratios.get("Debt/Equity")
+        with cols[0]:
+            st.metric("Debt/Equity", 
+                     fmt(de) if de is not None else "N/A",
+                     help="Total debt / total equity")
+            if de is not None:
+                if de > 2:
+                    st.error("🔴 >2: High leverage (Target: <1)")
+                elif de > 1:
+                    st.warning("🟡 Moderate (1-2)")
+                else:
+                    st.success("🟢 Conservative (<1)")
+        
+        # Debt/Assets
+        da = latest_ratios.get("Debt/Assets")
+        with cols[1]:
+            st.metric("Debt/Assets", 
+                     fmt(da) if da is not None else "N/A",
+                     help="Total debt / total assets")
+            if da is not None:
+                if da > 0.5:
+                    st.error("🔴 >0.5: Asset-heavy debt (Target: <0.3)")
+                elif da > 0.3:
+                    st.warning("🟡 Moderate (0.3-0.5)")
+                else:
+                    st.success("🟢 Conservative (<0.3)")
+    
+    # Industry Comparison Section
+    st.markdown("---")
+    st.markdown("#### 🏭 Industry Benchmark Comparison")
+    st.warning("Industry benchmark data coming soon! We'll soon add comparison against sector averages.")
+
+def monte_carlo_simulation(start_value: float, mean_return: float, volatility: float, 
+                          years: int = 10, simulations: int = 500, steps_per_year: int = 252) -> np.ndarray:
+    """Run Monte Carlo simulation of portfolio growth using geometric Brownian motion.
+    
+    Args:
+        start_value: Initial portfolio value
+        mean_return: Expected annual return (decimal)
+        volatility: Annual volatility (standard deviation)
+        years: Time horizon in years
+        simulations: Number of simulation paths
+        steps_per_year: Number of time steps per year
+        
+    Returns:
+        Numpy array of simulation paths (simulations x time steps)
+    """
+    dt = 1 / steps_per_year
+    total_steps = int(steps_per_year * years)
+    results = np.zeros((simulations, total_steps))
+    
+    for i in range(simulations):
+        prices = [start_value]
+        for _ in range(total_steps - 1):
+            shock = np.random.normal(loc=(mean_return - 0.5 * volatility**2) * dt, 
+                                    scale=volatility * np.sqrt(dt))
+            prices.append(prices[-1] * np.exp(shock))
+        results[i] = prices
+        
+    return results
+
+def calculate_annual_returns(close_prices: pd.DataFrame, weights: np.ndarray) -> pd.Series:
+    """Calculate annual returns for the portfolio"""
+    # Resample to yearly closing prices
+    yearly_prices = close_prices.resample('Y').last()
+    # Calculate yearly returns
+    yearly_returns = yearly_prices.pct_change().dropna()
+    # Calculate weighted portfolio returns
+    port_returns = (yearly_returns * weights).sum(axis=1)
+    return port_returns
+
+def fetch_stock_info_with_retry(ticker: str, max_retries: int = 3, delay: float = 1.0) -> Optional[Dict]:
+    """Fetch stock info with proxy rotation and retry logic."""
+    for attempt in range(max_retries):
+        proxy = get_proxy_dict()
+        try:
+            ticker_obj = yf.Ticker(ticker, proxy=proxy)
+            info = ticker_obj.info
+            if info and "quoteType" in info:
+                return info
+            # Fallback to fast_info
+            fast_info = getattr(ticker_obj, "fast_info", None)
+            if fast_info:
+                return fast_info
+        except Exception as e:
+            if st.session_state.get('debug_mode', False):
+                st.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
+        time.sleep(delay * (2 ** attempt))  # Exponential backoff
+    return None
+
+def fetch_all_stock_info(tickers: List[str], max_workers: int = 5) -> Dict[str, Optional[Dict]]:
+    """Fetch info for all tickers in parallel with retry and proxy rotation."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ticker = {executor.submit(fetch_stock_info_with_retry, ticker): ticker for ticker in tickers}
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                results[ticker] = future.result()
+            except Exception as exc:
+                results[ticker] = None
+    return results
+
+def get_cached_stock_info(ticker: str) -> Optional[Dict]:
+    """Get stock info from session cache or fetch if not present."""
+    cache = st.session_state.setdefault('stock_info_cache', {})
+    if ticker in cache:
+        return cache[ticker]
+    info = fetch_stock_info_with_retry(ticker)
+    cache[ticker] = info
+    return info
+
+def get_proxy_dict_enhanced(probability=0.3, max_retries=2):
+    """Improved proxy fetcher with fallback"""
+    if not PROXY_AVAILABLE or random.random() > probability:
+        return None
+    for _ in range(max_retries):
+        try:
+            proxy = FreeProxy(rand=True, timeout=5).get()
+            if proxy:
+                return {"http": proxy, "https": proxy}
+        except Exception:
+            continue
+    return None
+
+# Enhanced stock history fetcher with retry, delay, and proxy fallback
+def fetch_stock_history_enhanced(
+    ticker,
+    period=None,
+    interval="1d",
+    start=None,
+    end=None,
+    max_retries=3
+):
+    """Improved stock history fetcher with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            proxy = get_proxy_dict_enhanced(probability=0.3)
+            ticker_obj = yf.Ticker(ticker, proxy=proxy)
+            time.sleep(0.5 + random.random())  # Add small delay between requests
+            if start and end:
+                hist = ticker_obj.history(
+                    start=start.strftime('%Y-%m-%d') if isinstance(start, datetime) else start,
+                    end=end.strftime('%Y-%m-%d') if isinstance(end, datetime) else end,
+                    interval=interval,
+                    timeout=10
+                )
+            elif period:
+                hist = ticker_obj.history(
+                    period=period,
+                    interval=interval,
+                    timeout=10
+                )
+            else:
+                return None
+            if hist is not None and not hist.empty:
+                return hist
+        except Exception as e:
+            if attempt == max_retries - 1:
+                if st.session_state.get('debug_mode', False):
+                    st.error(f"Final attempt failed for {ticker}: {str(e)}")
+            time.sleep(2 ** attempt)  # Exponential backoff
+    return None
+
+# Caching strategy improvements for stock info
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stock_info_cached(ticker):
+    """Cached version with better error handling"""
+    try:
+        info = fetch_stock_info_with_retry(ticker)
+        if not info or "quoteType" not in info:
+            return None
+        return info
+    except Exception as e:
+        if st.session_state.get('debug_mode', False):
+            st.error(f"Cache error for {ticker}: {str(e)}")
+        return None
+
+# Parallel fetching for multiple stocks with rate control
+def fetch_multiple_stocks_parallel(tickers, max_workers=4):
+    """Fetch multiple stocks with controlled parallelism"""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ticker = {
+            executor.submit(fetch_stock_history_enhanced, ticker): ticker 
+            for ticker in tickers
+        }
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                results[ticker] = future.result()
+            except Exception as exc:
+                results[ticker] = None
+                if st.session_state.get('debug_mode', False):
+                    st.warning(f"{ticker} generated an exception: {exc}")
+    return results
+
+# Main App Content
+def main():
+    """Main application function"""
+    st.title("Optimal Portfolio Dashboard")
+    
+    # Check for missing dependencies
+    missing_deps = []
+    if not YFINANCE_AVAILABLE:
+        missing_deps.append("yfinance")
+    if not WEB_SCRAPING_AVAILABLE:
+        missing_deps.append("requests, beautifulsoup4")
+    if not SCIPY_AVAILABLE:
+        missing_deps.append("scipy")
+    
+    if missing_deps:
+        st.error(f"Missing dependencies: {', '.join(missing_deps)}")
+        st.info("Please install missing packages using: pip install " + " ".join(missing_deps))
+        st.stop()
+    
+    # Debug mode toggle
+    st.session_state['debug_mode'] = st.sidebar.checkbox("Debug Mode", value=st.session_state.get('debug_mode', False))
+    
+    # Portfolio input section
+    st.subheader("Portfolio Setup")
+    
+    # Fetch S&P 500 tickers
+    with st.spinner("Loading S&P 500 stocks..."):
+        sp500_tickers = fetch_sp500_tickers()
+    
+    # Stock selection interface - use full width
+    selected_from_dropdown = st.multiselect(
+        "Select stocks from S&P 500:",
+        options=sp500_tickers if sp500_tickers else [],
+        default=['AAPL', 'GOOGL', 'MSFT', 'TSLA'] if sp500_tickers and all(t in sp500_tickers for t in ['AAPL', 'GOOGL', 'MSFT', 'TSLA']) else (sp500_tickers[:4] if sp500_tickers else []),
+        help="Select multiple stocks from the S&P 500"
+    )
+    
+    # Combine selections and remove duplicates
+    final_tickers = remove_duplicates(selected_from_dropdown)
+    
+    # Risk level selector with radio buttons
+    risk_levels = ["Low", "Moderate", "High", "Custom"]
+    current_risk_level = st.session_state.get('risk_level', 'Moderate')
+    
+    # Display risk level descriptions
+    risk_descriptions = {
+        "Low": "🛡️ Minimize portfolio volatility for conservative investors",
+        "Moderate": "⚖️ Maximize Sharpe ratio for balanced risk-return",
+        "High": "🚀 Maximize expected returns for aggressive investors",
+        "Custom": "🎛️ Manually set your own portfolio weights"
+    }
+    
+    # Create radio buttons for risk level selection
+    selected_risk_level = st.radio(
+        "Select Risk Level:",
+        options=risk_levels,
+        index=risk_levels.index(current_risk_level) if current_risk_level in risk_levels else 1,
+        help="Choose your investment strategy",
+        format_func=lambda x: f"{x} - {risk_descriptions[x]}"
+    )
+    
+    # Update session state and handle custom weights
+    if selected_risk_level != st.session_state.get('risk_level'):
+        st.session_state['risk_level'] = selected_risk_level
+        # Reset custom weights when changing risk level
+        if selected_risk_level != "Custom":
+            st.session_state['custom_weights'] = {}
+        if st.session_state.get('portfolio_created', False):
+            st.rerun()
+    
+    # Handle custom weights immediately after risk level selection
+    if selected_risk_level == "Custom" and final_tickers:
+        st.markdown("### 🎛️ Custom Weight Allocation")
+        
+        # Initialize or get existing custom weights
+        custom_weights = st.session_state.get('custom_weights', {})
+        
+        # Update custom weights for current tickers
+        for ticker in final_tickers:
+            if ticker not in custom_weights:
+                # Initialize new tickers with equal weight
+                custom_weights[ticker] = 100.0/len(final_tickers)
+        
+        # Remove weights for tickers that are no longer selected
+        custom_weights = {k: v for k, v in custom_weights.items() if k in final_tickers}
+        
+        # Normalize weights if we have tickers
+        if final_tickers:
+            total_weight = sum(custom_weights.values())
+            if total_weight > 0:
+                custom_weights = {k: (v/total_weight)*100 for k, v in custom_weights.items()}
+            else:
+                custom_weights = {ticker: 100.0/len(final_tickers) for ticker in final_tickers}
+        
+        total_weight = 0.0
+        cols = st.columns(min(len(final_tickers), 4))  # Max 4 columns for better layout
+        
+        for i, ticker in enumerate(final_tickers):
+            with cols[i % len(cols)]:
+                current_weight = custom_weights.get(ticker, 100.0/len(final_tickers))
+                weight = st.number_input(
+                    f"{ticker} (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=current_weight,
+                    step=1.0,
+                    format="%.1f",
+                    key=f"weight_{ticker}"
+                )
+                custom_weights[ticker] = weight
+                total_weight += weight
+        
+        # Update session state
+        st.session_state['custom_weights'] = custom_weights
+        
+        # Validate total weight
+        if abs(total_weight - 100.0) > 0.01:
+            st.warning(f"⚠️ Total weights must sum to 100%. Current total: {total_weight:.1f}%")
+            st.stop()
+        else:
+            st.success("✅ Weights sum to 100%")
+    
+    # --- Year Range Selection ---
+    current_year = datetime.today().year
+    year_options = list(range(2010, current_year + 1))
+    
+    # Get stored years or use defaults
+    stored_start_year = st.session_state.get('start_year', 2018)
+    stored_end_year = st.session_state.get('end_year', current_year)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        start_year = st.selectbox(
+            "Start Year",
+            options=year_options,
+            index=year_options.index(stored_start_year) if stored_start_year in year_options else year_options.index(2018)
+        )
+    with col2:
+        end_year = st.selectbox(
+            "End Year",
+            options=year_options,
+            index=year_options.index(stored_end_year) if stored_end_year in year_options else year_options.index(current_year)
+        )
+
+    # Ensure end year is after start year
+    if start_year >= end_year:
+        st.warning("End year must be after start year.")
+        st.stop()
+
+    # Create date range from years
+    start_date = datetime(start_year, 1, 1)
+    end_date = datetime(end_year, 12, 31)
+
+    # Store years in session state
+    st.session_state['start_year'] = start_year
+    st.session_state['end_year'] = end_year
+    st.session_state['start_date'] = start_date
+    st.session_state['end_date'] = end_date
+    
+    # Create portfolio button - centered
+    if final_tickers:
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            if st.button("Create Optimal Portfolio", use_container_width=True):
+                st.session_state['portfolio_tickers'] = final_tickers
+                st.session_state['portfolio_created'] = True
+                st.success(f"Portfolio created with {len(final_tickers)} stocks!")
+    
+    # Show portfolio analysis if created
+    if st.session_state.get('portfolio_created', False):
+        tickers = st.session_state.get('portfolio_tickers', [])
+        
+        st.subheader("Portfolio Analysis")
+        
+        # Display optimal portfolio with current risk level
+        display_optimal_portfolio(tickers)
+        
+        # Display benchmark comparison
+        display_benchmark_comparison(tickers)
+        
+        # Chart section with timeframe selector
+        st.subheader("Portfolio Performance Chart")
+        
+        # Timeframe selector for chart only
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            chart_timeframe = st.selectbox(
+                "Select Chart Timeframe:",
+                options=['1D', '5D', '1M', '6M', '1Y', 'YTD', '5Y', '10Y'],
+                index=2,  # Default to 1M
+                help="Choose the time period for the chart display",
+                key="chart_timeframe"
+            )
+        
+        # Create and display chart using selected timeframe
+        create_portfolio_chart(tickers, chart_timeframe)
+
+# Gradient-based color formatting for DataFrame
+
+def gradient_performance(val, positive_is_good=True):
+    """Apply conditional formatting with red-yellow-green gradient"""
+    if isinstance(val, str) and '%' in val:
+        try:
+            num = float(val.replace('%', '').replace('+', ''))
+            if positive_is_good:
+                # For metrics where higher is better (returns, change %)
+                norm = min(max((num + 100) / 200, 0), 1)
+                color = matplotlib.colors.rgb2hex(matplotlib.cm.RdYlGn(norm))
+            else:
+                # For metrics where lower is better (volatility)
+                norm = min(max(num / 100, 0), 1)
+                color = matplotlib.colors.rgb2hex(matplotlib.cm.RdYlGn_r(norm))
+            text_color = 'white' if norm > 0.7 or norm < 0.3 else 'black'
+            return f'background-color: {color}; color: {text_color}'
+        except:
+            pass
+    return ''
+
+if __name__ == "__main__":
+    main()
