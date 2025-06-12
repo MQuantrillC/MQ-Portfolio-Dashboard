@@ -906,7 +906,7 @@ def display_optimal_portfolio(tickers: List[str]):
         portfolio_data.insert(2, 'Current Price', [f"${p:.2f}" if not pd.isna(p) else 'N/A' for p in current_prices])
         portfolio_data.insert(3, 'Start of Period Price', [f"${p:.2f}" if not pd.isna(p) else 'N/A' for p in start_prices])
         # Reorder columns for better display
-        display_cols = ['Ticker', 'Name', 'Current Price', 'Start of Period Price', 'Weight', 'Expected Return', 'Volatility', 'Change %', 'Market Cap', 'P/E Ratio', 'Beta']
+        display_cols = ['Ticker', 'Name', 'Weight', 'Current Price', 'Start of Period Price', 'Change %', 'Expected Return', 'Volatility', 'Market Cap', 'P/E Ratio', 'Beta']
         portfolio_data = portfolio_data[display_cols]
         st.dataframe(portfolio_data, use_container_width=True)
         st.markdown('''
