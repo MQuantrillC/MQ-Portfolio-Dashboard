@@ -738,27 +738,15 @@ def display_optimal_portfolio(tickers: List[str]):
     # Show portfolio info in a single line
     st.info(f"**Portfolio:** {', '.join(tickers)} | **Strategy:** {risk_descriptions.get(risk_level, risk_level)} | **Year Range:** {start_date.year} to {end_date.year}")
     
-    # Add data quality check for transparency
-    if st.session_state.get('debug_mode', False):
-        with st.expander("📊 Data Quality Status", expanded=False):
-            data_summary = get_data_availability_summary(tickers)
-            for ticker, availability in data_summary.items():
-                display_data_quality_indicator(
-                    ticker, 
-                    availability['info'], 
-                    availability['history'], 
-                    availability['financial']
-                )
-    
     # Initialize weights and metrics
     weights = None
     metrics = None
     
-    # Fetch historical data and calculate returns using enhanced methods
+    # Fetch historical data and calculate returns
     with st.spinner("Calculating portfolio metrics..."):
         returns_data = {}
         for ticker in tickers:
-            hist = fetch_stock_history_robust(
+            hist = fetch_stock_history(
                 ticker,
                 start=start_date,
                 end=end_date
@@ -832,71 +820,49 @@ def display_optimal_portfolio(tickers: List[str]):
     
     # Display allocation details
     if weights is not None:
-        # --- Enhanced parallel, cached info fetching ---
-        with st.spinner("Fetching comprehensive company data for all tickers..."):
-            # Use session cache for all tickers with enhanced fetching
-            cache = st.session_state.setdefault('stock_info_cache_enhanced', {})
+        # --- Parallel, cached info fetching ---
+        with st.spinner("Fetching company info for all tickers..."):
+            # Use session cache for all tickers
+            cache = st.session_state.setdefault('stock_info_cache', {})
             missing = [t for t in tickers if t not in cache]
             if missing:
-                fetched = fetch_multiple_info_parallel(missing, max_workers=4)
+                fetched = fetch_all_stock_info(missing)
                 cache.update(fetched)
             info_dict = {t: cache.get(t) for t in tickers}
         
         returns_data = {}
         for ticker in tickers:
-            # Use enhanced history fetching
-            hist = fetch_stock_history_robust(
+            hist = fetch_stock_history(
                 ticker,
                 start=start_date,
                 end=end_date
             )
             info = info_dict.get(ticker)
-            
-            # Get enhanced metrics with fallbacks
-            metrics = get_enhanced_ticker_metrics(ticker, info, hist)
-            
-            if hist is not None and not hist.empty and len(hist) > 10:  # Need sufficient data
-                try:
-                    daily_returns = hist["Close"].pct_change().dropna()
-                    if len(daily_returns) > 0:
-                        annual_return = (1 + daily_returns.mean()) ** 252 - 1
-                        annual_volatility = daily_returns.std() * (252 ** 0.5)
-                        start_price = hist["Close"].iloc[0]
-                        end_price = hist["Close"].iloc[-1]
-                        pct_change = ((end_price - start_price) / start_price) * 100
-                        
-                        returns_data[ticker] = {
-                            'Name': metrics.get('shortName', ticker),
-                            'Expected Return': f"{annual_return*100:.2f}%",
-                            'Volatility': f"{annual_volatility*100:.2f}%",
-                            'Change %': f"{pct_change:.2f}%",
-                            'Market Cap': format_value(metrics.get('marketCap')) if metrics.get('marketCap') != 'N/A' else 'N/A',
-                            'P/E Ratio': f"{metrics.get('trailingPE')}" if metrics.get('trailingPE') != 'N/A' else 'N/A',
-                            'Beta': f"{metrics.get('beta')}" if metrics.get('beta') != 'N/A' else 'N/A'
-                        }
-                    else:
-                        raise ValueError("Insufficient return data")
-                except Exception:
-                    # Fallback for insufficient data
-                    returns_data[ticker] = {
-                        'Name': metrics.get('shortName', ticker),
-                        'Expected Return': 'N/A',
-                        'Volatility': 'N/A',
-                        'Change %': 'N/A',
-                        'Market Cap': format_value(metrics.get('marketCap')) if metrics.get('marketCap') != 'N/A' else 'N/A',
-                        'P/E Ratio': f"{metrics.get('trailingPE')}" if metrics.get('trailingPE') != 'N/A' else 'N/A',
-                        'Beta': f"{metrics.get('beta')}" if metrics.get('beta') != 'N/A' else 'N/A'
-                    }
-            else:
-                # No historical data available
+            if hist is not None and not hist.empty:
+                daily_returns = hist["Close"].pct_change().dropna()
+                annual_return = (1 + daily_returns.mean()) ** 252 - 1
+                annual_volatility = daily_returns.std() * (252 ** 0.5)
+                start_price = hist["Close"].iloc[0]
+                end_price = hist["Close"].iloc[-1]
+                pct_change = ((end_price - start_price) / start_price) * 100
                 returns_data[ticker] = {
-                    'Name': metrics.get('shortName', ticker),
+                    'Name': info.get('shortName', 'N/A') if info else 'N/A',
+                    'Expected Return': f"{annual_return*100:.2f}%",
+                    'Volatility': f"{annual_volatility*100:.2f}%",
+                    'Change %': f"{pct_change:.2f}%",
+                    'Market Cap': format_value(info.get('marketCap')) if info else 'N/A',
+                    'P/E Ratio': f"{info.get('trailingPE', 'N/A')}" if info else 'N/A',
+                    'Beta': f"{info.get('beta', 'N/A')}" if info else 'N/A'
+                }
+            else:
+                returns_data[ticker] = {
+                    'Name': info.get('shortName', 'N/A') if info else 'N/A',
                     'Expected Return': 'N/A',
                     'Volatility': 'N/A',
                     'Change %': 'N/A',
-                    'Market Cap': format_value(metrics.get('marketCap')) if metrics.get('marketCap') != 'N/A' else 'N/A',
-                    'P/E Ratio': f"{metrics.get('trailingPE')}" if metrics.get('trailingPE') != 'N/A' else 'N/A',
-                    'Beta': f"{metrics.get('beta')}" if metrics.get('beta') != 'N/A' else 'N/A'
+                    'Market Cap': format_value(info.get('marketCap')) if info else 'N/A',
+                    'P/E Ratio': f"{info.get('trailingPE', 'N/A')}" if info else 'N/A',
+                    'Beta': f"{info.get('beta', 'N/A')}" if info else 'N/A'
                 }
         # Create portfolio data DataFrame
         portfolio_data = pd.DataFrame.from_dict(returns_data, orient='index')
@@ -1118,7 +1084,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
                     # Income Statement Tab
                     with statement_tabs[0]:
                         with st.spinner(f"Loading {ticker} Income Statement..."):
-                            income_stmt = fetch_financial_statement_enhanced(ticker, "income", "Annual")
+                            income_stmt = fetch_financial_statement(ticker, "income", "Annual")
                             if income_stmt is not None and not income_stmt.empty:
                                 # Initialize filtered_data with correct columns
                                 filtered_data = pd.DataFrame(columns=income_stmt.columns)
@@ -1139,7 +1105,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
                     # Balance Sheet Tab
                     with statement_tabs[1]:
                         with st.spinner(f"Loading {ticker} Balance Sheet..."):
-                            balance_sheet = fetch_financial_statement_enhanced(ticker, "balance", "Annual")
+                            balance_sheet = fetch_financial_statement(ticker, "balance", "Annual")
                             if balance_sheet is not None and not balance_sheet.empty:
                                 # Initialize filtered_data with correct columns
                                 filtered_data = pd.DataFrame(columns=balance_sheet.columns)
@@ -1160,7 +1126,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
                     # Cash Flow Tab
                     with statement_tabs[2]:
                         with st.spinner(f"Loading {ticker} Cash Flow Statement..."):
-                            cash_flow = fetch_financial_statement_enhanced(ticker, "cashflow", "Annual")
+                            cash_flow = fetch_financial_statement(ticker, "cashflow", "Annual")
                             if cash_flow is not None and not cash_flow.empty:
                                 # Initialize filtered_data with correct columns
                                 filtered_data = pd.DataFrame(columns=cash_flow.columns)
@@ -1200,10 +1166,10 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
         end_date = st.session_state.get('end_date')
         risk_level = st.session_state.get('risk_level', 'Moderate')
         
-        # Fetch historical data and calculate returns using enhanced fetching
+        # Fetch historical data and calculate returns
         returns_data = {}
         for ticker in tickers:
-            hist = fetch_stock_history_robust(ticker, start=start_date, end=end_date)
+            hist = fetch_stock_history(ticker, start=start_date, end=end_date)
             if hist is not None and not hist.empty:
                 returns_data[ticker] = hist['Close'].pct_change().dropna()
         
@@ -1912,17 +1878,10 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
                 st.info("Not enough data to display yearly performance breakdown.")
 
 def display_ticker_info(ticker: str):
-    """Display detailed information for a single ticker with enhanced data fetching"""
-    with st.spinner(f"Fetching comprehensive data for {ticker}..."):
-        # Use enhanced fetching with fallbacks
-        info = fetch_stock_info_enhanced(ticker)
-        hist_1y = fetch_stock_history_robust(ticker, period='1y')
-        
-        # Get enhanced metrics with fallbacks
-        metrics = get_enhanced_ticker_metrics(ticker, info, hist_1y)
-    
-    if not info and not hist_1y:
-        st.error(f"Could not fetch any information for {ticker}")
+    """Display detailed information for a single ticker"""
+    info = fetch_stock_info(ticker)
+    if not info:
+        st.error(f"Could not fetch information for {ticker}")
         return
     
     # Company Information
@@ -1936,99 +1895,47 @@ def display_ticker_info(ticker: str):
     with st.container():
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("Company Name", metrics.get('shortName', ticker))
-            # Enhanced CEO extraction with multiple fallbacks
-            ceo_name = 'N/A'
-            if info:
-                officers = info.get('companyOfficers', [])
-                if officers and isinstance(officers, list) and len(officers) > 0:
-                    ceo_name = officers[0].get('name', 'N/A')
-                elif info.get('website'):  # If we have website, we have some company data
-                    ceo_name = 'Available on company website'
-            st.metric("CEO", ceo_name)
-            
-            # Enhanced employee count with formatting
-            employees = info.get('fullTimeEmployees') if info else None
-            if employees and employees > 0:
-                emp_display = format_value(employees, prefix='', suffix='', decimals=0)
-            else:
-                emp_display = 'N/A'
-            st.metric("Employees", emp_display)
-            
+            st.metric("Company Name", info.get('shortName', 'N/A'))
+            st.metric("CEO", info.get('companyOfficers', [{}])[0].get('name', 'N/A') if info.get('companyOfficers') else 'N/A')
+            st.metric("Employees", format_value(info.get('fullTimeEmployees', 0), prefix='', suffix='', decimals=0))
         with col2:
-            st.metric("Sector", metrics.get('sector', 'N/A'))
-            st.metric("Industry", metrics.get('industry', 'N/A'))
-            
-            # Enhanced location with multiple fallbacks
-            location = 'N/A'
-            if info:
-                city = info.get('city', '')
-                state = info.get('state', '')
-                country = info.get('country', '')
-                if city and state:
-                    location = f"{city}, {state}"
-                elif city and country:
-                    location = f"{city}, {country}"
-                elif country:
-                    location = country
-            st.metric("Headquarters", location)
-            
-        # Enhanced current price with multiple sources
-        current_price = metrics.get('currentPrice')
-        if current_price != 'N/A' and current_price is not None:
-            price_display = format_value(current_price)
-        else:
-            price_display = 'N/A'
-        st.metric("Current Stock Price", price_display)
+            st.metric("Sector", info.get('sector', 'N/A'))
+            st.metric("Industry", info.get('industry', 'N/A'))
+            st.metric("Headquarters", f"{info.get('city', 'N/A')}, {info.get('state', 'N/A')}")
+        # Add current stock price as a metric (spanning both columns)
+        st.metric("Current Stock Price", format_value(info.get('currentPrice', None)))
     
-    # Historical Prices with enhanced fetching
+    # Historical Prices
     st.markdown("### Historical Prices")
+    # Updated period labels
     periods = {
         '1 Month Ago': '1mo',
-        '6 Months Ago': '6mo', 
+        '6 Months Ago': '6mo',
         '1 Year Ago': '1y',
         '5 Years Ago': '5y'
     }
     price_data = []
-    
     for period_name, period in periods.items():
-        hist = fetch_stock_history_robust(ticker, period=period)
-        if hist is not None and not hist.empty and len(hist) > 1:
-            try:
-                current_price = hist['Close'].iloc[-1]
-                start_price = hist['Close'].iloc[0]
-                change_pct = ((current_price - start_price) / start_price) * 100
-                price_data.append({
-                    'Period': period_name,
-                    'Price': format_value(start_price),
-                    'Change': f"{change_pct:+.2f}%"
-                })
-            except Exception:
-                continue
-    
+        hist = fetch_stock_history(ticker, period=period)
+        if hist is not None and not hist.empty:
+            current_price = hist['Close'].iloc[-1]
+            start_price = hist['Close'].iloc[0]
+            change_pct = ((current_price - start_price) / start_price) * 100
+            price_data.append({
+                'Period': period_name,
+                'Price': format_value(start_price),
+                'Change': f"{change_pct:+.2f}%"
+            })
     if price_data:
         df = pd.DataFrame(price_data)
         st.dataframe(df.style.set_properties(**{'font-size': '13px'}), use_container_width=True)
-    else:
-        st.warning("Historical price data temporarily unavailable")
-    
-    # Enhanced 52 Week High/Low with fallbacks
+    # 52 Week High/Low
     st.markdown("### 52 Week Range")
     col1, col2 = st.columns(2)
     with col1:
-        high_52w = metrics.get('fiftyTwoWeekHigh')
-        if high_52w != 'N/A' and high_52w is not None:
-            high_display = format_value(high_52w)
-        else:
-            high_display = 'N/A'
-        st.metric("52 Week High", high_display)
+        st.metric("52 Week High", format_value(info.get('fiftyTwoWeekHigh')))
     with col2:
-        low_52w = metrics.get('fiftyTwoWeekLow')
-        if low_52w != 'N/A' and low_52w is not None:
-            low_display = format_value(low_52w)
-        else:
-            low_display = 'N/A'
-        st.metric("52 Week Low", low_display)
+        st.metric("52 Week Low", format_value(info.get('fiftyTwoWeekLow')))
 
 def format_financial_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Simplify financial columns to just year labels (e.g., 2022) and sort descending.
@@ -3171,307 +3078,6 @@ def gradient_performance(val, positive_is_good=True):
         except:
             pass
     return ''
-
-# Enhanced data fetching with multiple sources and fallbacks
-@st.cache_data(ttl=1800, show_spinner=False)  # 30 min cache
-def fetch_stock_info_enhanced(ticker: str, max_retries: int = 3) -> Optional[Dict]:
-    """Enhanced stock info fetcher with multiple data sources and fallbacks."""
-    
-    # Try multiple data sources in order of preference
-    data_sources = [
-        lambda t: _fetch_yf_info(t),
-        lambda t: _fetch_yf_fast_info(t),
-        lambda t: _fetch_yf_basic_info(t)
-    ]
-    
-    for attempt in range(max_retries):
-        for source_func in data_sources:
-            try:
-                # Rotate proxy for each attempt
-                proxy = get_proxy_dict_enhanced(probability=0.4)
-                if proxy:
-                    yf.set_config(proxy=proxy)
-                else:
-                    yf.set_config(proxy=None)
-                
-                result = source_func(ticker)
-                if result and len(result) > 5:  # Ensure we got meaningful data
-                    return result
-                    
-            except Exception as e:
-                if st.session_state.get('debug_mode', False) and attempt == max_retries - 1:
-                    st.warning(f"Data source failed for {ticker}: {str(e)[:100]}")
-                continue
-        
-        # Exponential backoff between attempts
-        if attempt < max_retries - 1:
-            time.sleep(0.5 * (2 ** attempt))
-    
-    return None
-
-def _fetch_yf_info(ticker: str) -> Optional[Dict]:
-    """Primary yfinance info method."""
-    ticker_obj = yf.Ticker(ticker)
-    info = ticker_obj.info
-    if info and isinstance(info, dict) and "symbol" in info:
-        return info
-    return None
-
-def _fetch_yf_fast_info(ticker: str) -> Optional[Dict]:
-    """Fallback to yfinance fast_info."""
-    ticker_obj = yf.Ticker(ticker)
-    try:
-        fast_info = ticker_obj.fast_info
-        if fast_info:
-            # Convert fast_info to dict format similar to info
-            return {
-                'symbol': ticker,
-                'shortName': ticker,
-                'currentPrice': getattr(fast_info, 'last_price', None),
-                'marketCap': getattr(fast_info, 'market_cap', None),
-                'fiftyTwoWeekHigh': getattr(fast_info, 'year_high', None),
-                'fiftyTwoWeekLow': getattr(fast_info, 'year_low', None),
-                'currency': getattr(fast_info, 'currency', 'USD'),
-                'quoteType': 'EQUITY'
-            }
-    except:
-        pass
-    return None
-
-def _fetch_yf_basic_info(ticker: str) -> Optional[Dict]:
-    """Last resort: basic ticker info from history."""
-    try:
-        ticker_obj = yf.Ticker(ticker)
-        hist = ticker_obj.history(period="5d")
-        if not hist.empty:
-            current_price = hist['Close'].iloc[-1]
-            return {
-                'symbol': ticker,
-                'shortName': ticker,
-                'currentPrice': current_price,
-                'quoteType': 'EQUITY'
-            }
-    except:
-        pass
-    return None
-
-@st.cache_data(ttl=1800, show_spinner=False)  # 30 min cache
-def fetch_financial_statement_enhanced(
-    ticker: str,
-    statement_type: str,
-    period: str = "Annual",
-    max_retries: int = 2
-) -> Optional[pd.DataFrame]:
-    """Enhanced financial statement fetcher with better error handling."""
-    
-    for attempt in range(max_retries):
-        try:
-            # Use different proxy probability for financial data
-            proxy = get_proxy_dict_enhanced(probability=0.2)
-            if proxy:
-                yf.set_config(proxy=proxy)
-            else:
-                yf.set_config(proxy=None)
-            
-            ticker_obj = yf.Ticker(ticker)
-            
-            # Add small delay to avoid rate limiting
-            time.sleep(0.3 + random.random() * 0.2)
-            
-            if statement_type == "balance":
-                data = ticker_obj.balance_sheet if period == "Annual" else ticker_obj.quarterly_balance_sheet
-            elif statement_type == "income":
-                data = ticker_obj.income_stmt if period == "Annual" else ticker_obj.quarterly_income_stmt
-            elif statement_type == "cashflow":
-                data = ticker_obj.cashflow if period == "Annual" else ticker_obj.quarterly_cashflow
-            else:
-                return None
-            
-            if data is not None and not data.empty:
-                # More lenient filtering - keep columns with at least some data
-                filtered_data = data.loc[:, data.isna().mean() < 0.8]  # Keep if <80% NaN
-                if not filtered_data.empty:
-                    return filtered_data
-                    
-        except Exception as e:
-            if st.session_state.get('debug_mode', False) and attempt == max_retries - 1:
-                st.warning(f"Financial statement error for {ticker}: {str(e)[:100]}")
-            
-            if attempt < max_retries - 1:
-                time.sleep(1.0 * (attempt + 1))
-    
-    return None
-
-@st.cache_data(ttl=900, show_spinner=False)  # 15 min cache for price data
-def fetch_stock_history_robust(
-    ticker: str,
-    period: Optional[str] = None,
-    interval: str = "1d",
-    start: Optional[Union[str, datetime]] = None,
-    end: Optional[Union[str, datetime]] = None,
-    max_retries: int = 3
-) -> Optional[pd.DataFrame]:
-    """Robust stock history fetcher with multiple fallback periods."""
-    
-    # If specific period fails, try these fallbacks
-    fallback_periods = []
-    if period:
-        fallback_map = {
-            '1mo': ['1mo', '3mo', '6mo'],
-            '6mo': ['6mo', '1y', '3mo'],
-            '1y': ['1y', '2y', '6mo'],
-            '5y': ['5y', '2y', '1y']
-        }
-        fallback_periods = fallback_map.get(period, [period])
-    
-    for attempt in range(max_retries):
-        periods_to_try = fallback_periods if fallback_periods else [period]
-        
-        for try_period in periods_to_try:
-            try:
-                proxy = get_proxy_dict_enhanced(probability=0.3)
-                if proxy:
-                    yf.set_config(proxy=proxy)
-                else:
-                    yf.set_config(proxy=None)
-                
-                ticker_obj = yf.Ticker(ticker)
-                
-                # Add jitter to avoid rate limiting
-                time.sleep(0.2 + random.random() * 0.3)
-                
-                if start and end:
-                    start_str = start.strftime('%Y-%m-%d') if isinstance(start, datetime) else start
-                    end_str = end.strftime('%Y-%m-%d') if isinstance(end, datetime) else end
-                    hist = ticker_obj.history(start=start_str, end=end_str, interval=interval, timeout=15)
-                elif try_period:
-                    hist = ticker_obj.history(period=try_period, interval=interval, timeout=15)
-                else:
-                    continue
-                
-                if hist is not None and not hist.empty and len(hist) > 0:
-                    return hist
-                    
-            except Exception as e:
-                if st.session_state.get('debug_mode', False):
-                    st.warning(f"History attempt {attempt+1} failed for {ticker} ({try_period}): {str(e)[:100]}")
-                continue
-        
-        # Exponential backoff between full retry attempts
-        if attempt < max_retries - 1:
-            time.sleep(0.5 * (2 ** attempt))
-    
-    return None
-
-def fetch_multiple_info_parallel(tickers: List[str], max_workers: int = 4) -> Dict[str, Optional[Dict]]:
-    """Parallel fetching with enhanced error handling and rate limiting."""
-    results = {}
-    
-    # Process in smaller batches to avoid overwhelming the API
-    batch_size = min(max_workers, 6)
-    
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
-        
-        with ThreadPoolExecutor(max_workers=min(len(batch), max_workers)) as executor:
-            # Add staggered delays to avoid rate limiting
-            future_to_ticker = {}
-            for j, ticker in enumerate(batch):
-                future = executor.submit(
-                    lambda t, delay: (time.sleep(delay * 0.1), fetch_stock_info_enhanced(t))[1],
-                    ticker, j
-                )
-                future_to_ticker[future] = ticker
-            
-            for future in as_completed(future_to_ticker, timeout=30):
-                ticker = future_to_ticker[future]
-                try:
-                    results[ticker] = future.result()
-                except Exception as exc:
-                    results[ticker] = None
-                    if st.session_state.get('debug_mode', False):
-                        st.warning(f"Parallel fetch failed for {ticker}: {str(exc)[:100]}")
-        
-        # Brief pause between batches
-        if i + batch_size < len(tickers):
-            time.sleep(0.5)
-    
-    return results
-
-def get_enhanced_ticker_metrics(ticker: str, info: Dict, hist_data: Optional[pd.DataFrame] = None) -> Dict:
-    """Extract comprehensive metrics with multiple fallbacks."""
-    metrics = {
-        'shortName': 'N/A',
-        'currentPrice': 'N/A',
-        'marketCap': 'N/A',
-        'trailingPE': 'N/A',
-        'beta': 'N/A',
-        'fiftyTwoWeekHigh': 'N/A',
-        'fiftyTwoWeekLow': 'N/A',
-        'sector': 'N/A',
-        'industry': 'N/A'
-    }
-    
-    if info:
-        # Primary data extraction with multiple key attempts
-        for key, fallback_keys in [
-            ('shortName', ['shortName', 'longName', 'displayName', 'symbol']),
-            ('currentPrice', ['currentPrice', 'regularMarketPrice', 'price', 'lastPrice']),
-            ('marketCap', ['marketCap', 'enterpriseValue', 'sharesOutstanding']),
-            ('trailingPE', ['trailingPE', 'forwardPE', 'priceToEarningsTrailing12Months']),
-            ('beta', ['beta', 'beta3Year']),
-            ('fiftyTwoWeekHigh', ['fiftyTwoWeekHigh', '52WeekHigh', 'yearHigh']),
-            ('fiftyTwoWeekLow', ['fiftyTwoWeekLow', '52WeekLow', 'yearLow']),
-            ('sector', ['sector', 'sectorKey']),
-            ('industry', ['industry', 'industryKey'])
-        ]:
-            for fallback_key in fallback_keys:
-                value = info.get(fallback_key)
-                if value is not None and value != '' and str(value).lower() != 'none':
-                    metrics[key] = value
-                    break
-    
-    # Use historical data as fallback for price information
-    if hist_data is not None and not hist_data.empty:
-        if metrics['currentPrice'] == 'N/A':
-            metrics['currentPrice'] = hist_data['Close'].iloc[-1]
-        if metrics['fiftyTwoWeekHigh'] == 'N/A' and len(hist_data) > 200:
-            metrics['fiftyTwoWeekHigh'] = hist_data['High'].max()
-        if metrics['fiftyTwoWeekLow'] == 'N/A' and len(hist_data) > 200:
-            metrics['fiftyTwoWeekLow'] = hist_data['Low'].min()
-    
-    return metrics
-
-def display_data_quality_indicator(ticker: str, info_available: bool, hist_available: bool, financial_available: bool):
-    """Display data quality indicator to inform users about data availability."""
-    quality_score = sum([info_available, hist_available, financial_available])
-    
-    if quality_score == 3:
-        st.success(f"✅ **{ticker}**: Complete data available")
-    elif quality_score == 2:
-        st.info(f"ℹ️ **{ticker}**: Good data coverage (some limitations)")
-    elif quality_score == 1:
-        st.warning(f"⚠️ **{ticker}**: Limited data available")
-    else:
-        st.error(f"❌ **{ticker}**: Minimal data - results may be incomplete")
-
-def get_data_availability_summary(tickers: List[str]) -> Dict[str, Dict[str, bool]]:
-    """Get a summary of data availability for all tickers."""
-    summary = {}
-    
-    for ticker in tickers:
-        # Quick check for data availability
-        info = fetch_stock_info_enhanced(ticker)
-        hist = fetch_stock_history_robust(ticker, period='1mo')  # Quick check
-        financial = fetch_financial_statement_enhanced(ticker, "income", "Annual")
-        
-        summary[ticker] = {
-            'info': info is not None and len(info) > 5,
-            'history': hist is not None and not hist.empty,
-            'financial': financial is not None and not financial.empty
-        }
-    
-    return summary
 
 if __name__ == "__main__":
     main()
