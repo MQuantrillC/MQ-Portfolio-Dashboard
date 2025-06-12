@@ -1704,7 +1704,6 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
     end_date = st.session_state.get('end_date')
     start_year = start_date.year if start_date else None
     end_year = end_date.year if end_date else None
-    
     with st.spinner("Loading benchmark comparison..."):
         # Fetch portfolio data
         portfolio_data = {}
@@ -1724,20 +1723,17 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
         if weights is None:
             weights = np.array([1/len(tickers)] * len(tickers))  # Equal weights if not provided
         portfolio_value = portfolio_df.dot(weights)
-        # Fetch SPY data
-        if proxy:
-            yf.set_config(proxy=proxy)
-        else:
-            yf.set_config(proxy=None)
-        spy_data = yf.Ticker("SPY")
-        if spy_data is None or spy_data.empty:
+        # Fetch SPY data (fix: use .history() and check .empty on DataFrame)
+        spy_ticker = yf.Ticker("SPY")
+        spy_hist = spy_ticker.history(start=start_date, end=end_date)
+        if spy_hist is None or spy_hist.empty:
             st.error("Could not fetch S&P 500 data")
             return
         # Normalize both series to 100
         portfolio_normalized = portfolio_value / portfolio_value.iloc[0] * 100
-        spy_normalized = spy_data.history(period="1d")['Close'] / spy_data.history(period="1d")['Close'].iloc[0] * 100
+        spy_normalized = spy_hist['Close'] / spy_hist['Close'].iloc[0] * 100
         # --- Tabs for main chart and yearly breakdown ---
-        tab1, tab2 = st.tabs(["Performance Chart", "Yearly Performance Breakdown"])
+        tab1, tab2 = st.tabs(["Performance Chart", "📊 Yearly Performance Breakdown"])
         with tab1:
             # Create comparison chart
             fig = go.Figure()
