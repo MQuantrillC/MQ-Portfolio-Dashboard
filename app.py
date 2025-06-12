@@ -745,6 +745,8 @@ def display_optimal_portfolio(tickers: List[str]):
     # Fetch historical data and calculate returns
     with st.spinner("Calculating portfolio metrics..."):
         returns_data = {}
+        valid_tickers_for_optimization = []  # Track tickers with valid data for optimization
+        
         for ticker in tickers:
             hist = fetch_stock_history(
                 ticker,
@@ -753,6 +755,7 @@ def display_optimal_portfolio(tickers: List[str]):
             )
             if hist is not None and not hist.empty:
                 returns_data[ticker] = hist['Close'].pct_change().dropna()
+                valid_tickers_for_optimization.append(ticker)
         
         if returns_data:
             returns_df = pd.DataFrame(returns_data)
@@ -777,8 +780,8 @@ def display_optimal_portfolio(tickers: List[str]):
                     st.warning(f"Total custom weight = {total_weight:.2f}%. Must equal 100%.")
                     st.stop()
                 
-                # Convert custom weights to numpy array
-                weights = np.array([custom_weights[ticker]/100.0 for ticker in tickers])
+                # Convert custom weights to numpy array - only for valid tickers
+                weights = np.array([custom_weights.get(ticker, 0)/100.0 for ticker in valid_tickers_for_optimization])
             else:
                 # Optimize portfolio based on risk level
                 with st.spinner(f"Optimizing portfolio for {risk_level} risk level..."):
@@ -787,6 +790,8 @@ def display_optimal_portfolio(tickers: List[str]):
             # Calculate portfolio metrics
             if weights is not None:
                 metrics = calculate_portfolio_metrics(returns_df, weights)
+        else:
+            valid_tickers_for_optimization = []
     
     # Display portfolio metrics at the top
     if metrics:
@@ -873,28 +878,15 @@ def display_optimal_portfolio(tickers: List[str]):
         portfolio_data.index.name = 'Ticker'
         portfolio_data.reset_index(inplace=True)
         
-        # Filter weights to match only valid tickers (those with data)
-        if len(valid_tickers) < len(tickers):
-            # Some tickers don't have data, filter weights accordingly
-            valid_indices = [i for i, ticker in enumerate(tickers) if ticker in valid_tickers]
-            if weights is not None:
-                # Convert to numpy array if it isn't already
-                weights_array = np.array(weights) if not isinstance(weights, np.ndarray) else weights
-                filtered_weights = weights_array[valid_indices]
-                # Renormalize weights to sum to 1
-                filtered_weights = filtered_weights / filtered_weights.sum()
-            else:
-                filtered_weights = None
-        else:
-            filtered_weights = weights
-        
-        # Add weights to the portfolio data - use filtered weights for valid tickers, 0 for invalid ones
+        # Add weights to the portfolio data
         weight_values = []
         for ticker in portfolio_data['Ticker']:
-            if ticker in valid_tickers and filtered_weights is not None:
-                ticker_idx = valid_tickers.index(ticker)
-                weight_values.append(f"{filtered_weights[ticker_idx]*100:.1f}%")
+            if ticker in valid_tickers_for_optimization and weights is not None:
+                # Find the index of this ticker in the optimization results
+                ticker_idx = valid_tickers_for_optimization.index(ticker)
+                weight_values.append(f"{weights[ticker_idx]*100:.1f}%")
             else:
+                # Ticker had no valid data for optimization
                 weight_values.append("0.0%")
         
         portfolio_data['Weight'] = weight_values
