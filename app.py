@@ -1698,8 +1698,8 @@ custom_palette = px.colors.sequential.Blues + px.colors.sequential.Purples
 
 def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarray] = None):
     """Display portfolio performance comparison with S&P 500 using selected date range"""
-    st.subheader("Portfolio vs. S&P 500 Benchmark")
-    
+    st.subheader("📈 Portfolio vs. S&P 500 Benchmark")
+    proxy = get_proxy_dict()  # Ensure proxy is defined
     start_date = st.session_state.get('start_date')
     end_date = st.session_state.get('end_date')
     start_year = start_date.year if start_date else None
