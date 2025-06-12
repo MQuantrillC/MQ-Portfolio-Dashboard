@@ -887,7 +887,6 @@ def display_optimal_portfolio(tickers: List[str]):
         display_cols = ['Ticker', 'Name', 'Current Price', 'Start of Period Price', 'Weight', 'Expected Return', 'Volatility', 'Change %', 'Market Cap', 'P/E Ratio', 'Beta']
         portfolio_data = portfolio_data[display_cols]
         st.dataframe(portfolio_data, use_container_width=True)
-        # Add subtle help text below the table (unchanged)
         st.markdown('''
         <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
             <b>Expected Return:</b> Annualized return since start date (higher is better) • 
@@ -895,6 +894,59 @@ def display_optimal_portfolio(tickers: List[str]):
             <b>Change %:</b> Total percentage change since start date (higher is better)
         </div>
         ''', unsafe_allow_html=True)
+        # --- Pie charts in columns ---
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = px.pie(
+                portfolio_data,
+                values=[float(w.strip('%')) for w in portfolio_data['Weight']],
+                names=portfolio_data['Ticker'],
+                title='🥧 Portfolio Allocation',
+                hole=0.5,
+                color_discrete_sequence=px.colors.qualitative.Pastel
+            )
+            fig.update_traces(
+                textposition='inside', 
+                textinfo='percent+label',
+                hovertemplate='<b>%{label}</b><br>Weight: %{percent}<br>Value: %{value:.1f}%<extra></extra>',
+                marker=dict(line=dict(color='#FFFFFF', width=2))
+            )
+            fig.update_layout(
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            # Sector Allocation Pie Chart
+            sector_weights = {}
+            for i, ticker in enumerate(portfolio_data['Ticker']):
+                info = info_dict.get(ticker)
+                sector = info.get('sector', 'Other') if info else 'Other'
+                weight = float(portfolio_data['Weight'].iloc[i].strip('%'))
+                sector_weights[sector] = sector_weights.get(sector, 0) + weight
+            sector_df = pd.DataFrame({
+                'Sector': list(sector_weights.keys()),
+                'Weight': list(sector_weights.values())
+            })
+            fig_sector = px.pie(
+                sector_df,
+                values='Weight',
+                names='Sector',
+                title='🥧 Sector Allocation',
+                hole=0.5,
+                color_discrete_sequence=px.colors.qualitative.Pastel
+            )
+            fig_sector.update_traces(
+                textposition='inside',
+                textinfo='percent+label',
+                hovertemplate='<b>%{label}</b><br>Weight: %{percent}<br>Value: %{value:.1f}%<extra></extra>',
+                marker=dict(line=dict(color='#FFFFFF', width=2))
+            )
+            fig_sector.update_layout(
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_sector, use_container_width=True)
 
 def create_portfolio_chart(tickers: List[str], timeframe: str):
     """Create portfolio performance chart using the selected timeframe."""
