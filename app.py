@@ -831,6 +831,7 @@ def display_optimal_portfolio(tickers: List[str]):
             info_dict = {t: cache.get(t) for t in tickers}
         
         returns_data = {}
+        valid_tickers = []  # Track tickers with valid data
         for ticker in tickers:
             hist = fetch_stock_history(
                 ticker,
@@ -839,6 +840,7 @@ def display_optimal_portfolio(tickers: List[str]):
             )
             info = info_dict.get(ticker)
             if hist is not None and not hist.empty:
+                valid_tickers.append(ticker)
                 daily_returns = hist["Close"].pct_change().dropna()
                 annual_return = (1 + daily_returns.mean()) ** 252 - 1
                 annual_volatility = daily_returns.std() * (252 ** 0.5)
@@ -855,6 +857,7 @@ def display_optimal_portfolio(tickers: List[str]):
                     'Beta': f"{info.get('beta', 'N/A')}" if info else 'N/A'
                 }
             else:
+                # Still add to returns_data but mark as invalid
                 returns_data[ticker] = {
                     'Name': info.get('shortName', 'N/A') if info else 'N/A',
                     'Expected Return': 'N/A',
@@ -864,12 +867,33 @@ def display_optimal_portfolio(tickers: List[str]):
                     'P/E Ratio': f"{info.get('trailingPE', 'N/A')}" if info else 'N/A',
                     'Beta': f"{info.get('beta', 'N/A')}" if info else 'N/A'
                 }
+        
         # Create portfolio data DataFrame
         portfolio_data = pd.DataFrame.from_dict(returns_data, orient='index')
         portfolio_data.index.name = 'Ticker'
         portfolio_data.reset_index(inplace=True)
-        # Add weights to the portfolio data
-        portfolio_data['Weight'] = [f"{w*100:.1f}%" for w in weights]
+        
+        # Filter weights to match only valid tickers (those with data)
+        if len(valid_tickers) < len(tickers):
+            # Some tickers don't have data, filter weights accordingly
+            valid_indices = [i for i, ticker in enumerate(tickers) if ticker in valid_tickers]
+            filtered_weights = weights[valid_indices] if weights is not None else None
+            # Renormalize weights to sum to 1
+            if filtered_weights is not None:
+                filtered_weights = filtered_weights / filtered_weights.sum()
+        else:
+            filtered_weights = weights
+        
+        # Add weights to the portfolio data - use filtered weights for valid tickers, 0 for invalid ones
+        weight_values = []
+        for ticker in portfolio_data['Ticker']:
+            if ticker in valid_tickers and filtered_weights is not None:
+                ticker_idx = valid_tickers.index(ticker)
+                weight_values.append(f"{filtered_weights[ticker_idx]*100:.1f}%")
+            else:
+                weight_values.append("0.0%")
+        
+        portfolio_data['Weight'] = weight_values
         # Add Current Price and Start of Period Price columns
         current_prices = []
         start_prices = []
