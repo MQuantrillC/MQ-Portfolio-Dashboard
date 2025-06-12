@@ -195,17 +195,19 @@ def remove_duplicates(items: List[str]) -> List[str]:
     return list(dict.fromkeys(items))
 
 def get_proxy_dict(probability: float = 0.5) -> Optional[Dict[str, str]]:
-    """Get a random proxy with given probability"""
+    """Get a random proxy with given probability and better error handling"""
     if not PROXY_AVAILABLE:
         return None
         
     if random.random() < probability:
         try:
-            proxy = FreeProxy(rand=True).get()
-            return {"http": proxy}
+            # Try to get a working proxy with timeout
+            proxy = FreeProxy(rand=True, timeout=3).get()
+            if proxy and proxy.startswith('http'):
+                return {"http": proxy, "https": proxy}
         except Exception as e:
             if st.session_state.get('debug_mode', False):
-                st.error(f"Proxy error: {str(e)}")
+                st.warning(f"Proxy fetch failed: {str(e)[:50]}")
             return None
     return None
 
@@ -371,7 +373,7 @@ def fetch_sector_performance() -> Optional[pd.DataFrame]:
     
     performance_data = []
     for etf, sector in sector_etfs.items():
-        hist = fetch_stock_history(etf, period="1mo")
+        hist = fetch_stock_history_robust(etf, period="1mo")
         if hist is not None and not hist.empty:
             start_price = hist["Close"].iloc[0]
             end_price = hist["Close"].iloc[-1]
@@ -748,7 +750,7 @@ def display_optimal_portfolio(tickers: List[str]):
         valid_tickers_for_optimization = []  # Track tickers with valid data for optimization
         
         for ticker in tickers:
-            hist = fetch_stock_history(
+            hist = fetch_stock_history_robust(
                 ticker,
                 start=start_date,
                 end=end_date
@@ -825,20 +827,16 @@ def display_optimal_portfolio(tickers: List[str]):
     
     # Display allocation details
     if weights is not None:
-        # --- Parallel, cached info fetching ---
+        # --- Robust parallel info fetching ---
         with st.spinner("Fetching company info for all tickers..."):
-            # Use session cache for all tickers
-            cache = st.session_state.setdefault('stock_info_cache', {})
-            missing = [t for t in tickers if t not in cache]
-            if missing:
-                fetched = fetch_all_stock_info(missing)
-                cache.update(fetched)
-            info_dict = {t: cache.get(t) for t in tickers}
+            raw_info_dict = fetch_multiple_stock_info_robust(tickers, max_workers=3)
+            # Validate and clean the data
+            info_dict = {ticker: validate_stock_data(raw_info_dict.get(ticker), ticker) for ticker in tickers}
         
         returns_data = {}
         valid_tickers = []  # Track tickers with valid data
         for ticker in tickers:
-            hist = fetch_stock_history(
+            hist = fetch_stock_history_robust(
                 ticker,
                 start=start_date,
                 end=end_date
@@ -894,7 +892,7 @@ def display_optimal_portfolio(tickers: List[str]):
         current_prices = []
         start_prices = []
         for ticker in portfolio_data['Ticker']:
-            hist = fetch_stock_history(ticker, start=start_date, end=end_date)
+            hist = fetch_stock_history_robust(ticker, start=start_date, end=end_date)
             if hist is not None and not hist.empty:
                 start_prices.append(hist['Close'].iloc[0])
                 current_prices.append(hist['Close'].iloc[-1])
@@ -1001,7 +999,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
         # Use a qualitative palette for clear differentiation
         palette = px.colors.qualitative.Set2 + px.colors.qualitative.Set3
         for i, ticker in enumerate(tickers):
-            hist = fetch_stock_history(
+            hist = fetch_stock_history_robust(
                 ticker,
                 start=start_date,
                 end=end_date,
@@ -1781,7 +1779,7 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
         portfolio_data = {}
         valid_tickers = []
         for ticker in tickers:
-            hist = fetch_stock_history(
+            hist = fetch_stock_history_robust(
                 ticker,
                 start=start_date,
                 end=end_date
@@ -1853,7 +1851,7 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
             # Calculate annual returns for each ticker
             annual_returns = []
             for ticker in tickers:
-                hist = fetch_stock_history(
+                hist = fetch_stock_history_robust(
                     ticker,
                     start=start_date,
                     end=end_date
@@ -1915,8 +1913,10 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
 
 def display_ticker_info(ticker: str):
     """Display detailed information for a single ticker"""
-    info = fetch_stock_info(ticker)
-    if not info:
+    raw_info = fetch_stock_info_robust(ticker)
+    info = validate_stock_data(raw_info, ticker)
+    
+    if not info or info.get('quoteType') is None:
         st.error(f"Could not fetch information for {ticker}")
         return
     
@@ -1952,7 +1952,7 @@ def display_ticker_info(ticker: str):
     }
     price_data = []
     for period_name, period in periods.items():
-        hist = fetch_stock_history(ticker, period=period)
+        hist = fetch_stock_history_robust(ticker, period=period)
         if hist is not None and not hist.empty:
             current_price = hist['Close'].iloc[-1]
             start_price = hist['Close'].iloc[0]
@@ -3114,6 +3114,207 @@ def gradient_performance(val, positive_is_good=True):
         except:
             pass
     return ''
+
+# Enhanced data fetching with unified approach
+@st.cache_data(ttl=1800, show_spinner=False)  # 30 minutes cache
+def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]:
+    """Robust stock info fetcher with multiple fallback strategies"""
+    if not YFINANCE_AVAILABLE:
+        return None
+    
+    # Strategy 1: Try without proxy first (often faster and more reliable)
+    for attempt in range(max_retries):
+        try:
+            yf.set_config(proxy=None)
+            ticker_obj = yf.Ticker(ticker)
+            time.sleep(0.1)  # Small delay to respect rate limits
+            
+            info = ticker_obj.info
+            if info and len(info) > 5 and "quoteType" in info:  # Ensure we got real data
+                return info
+                
+            # Try fast_info as fallback
+            if hasattr(ticker_obj, 'fast_info'):
+                fast_info = ticker_obj.fast_info
+                if fast_info and hasattr(fast_info, 'last_price'):
+                    # Convert fast_info to dict format
+                    return {
+                        'currentPrice': getattr(fast_info, 'last_price', None),
+                        'marketCap': getattr(fast_info, 'market_cap', None),
+                        'shortName': ticker,
+                        'quoteType': 'EQUITY'
+                    }
+        except Exception as e:
+            if st.session_state.get('debug_mode', False) and attempt == max_retries - 1:
+                st.warning(f"No proxy attempt {attempt+1} failed for {ticker}: {str(e)[:100]}")
+            time.sleep(0.5 * (attempt + 1))
+    
+    # Strategy 2: Try with proxy if no-proxy failed
+    if PROXY_AVAILABLE:
+        for attempt in range(2):  # Fewer attempts with proxy
+            try:
+                proxy = get_proxy_dict(probability=1.0)  # Force proxy usage
+                if proxy:
+                    yf.set_config(proxy=proxy)
+                    ticker_obj = yf.Ticker(ticker)
+                    time.sleep(0.2)
+                    
+                    info = ticker_obj.info
+                    if info and len(info) > 5 and "quoteType" in info:
+                        return info
+            except Exception as e:
+                if st.session_state.get('debug_mode', False) and attempt == 1:
+                    st.warning(f"Proxy attempt failed for {ticker}: {str(e)[:100]}")
+                time.sleep(1.0)
+    
+    return None
+
+@st.cache_data(ttl=1800, show_spinner=False)  # 30 minutes cache
+def fetch_stock_history_robust(
+    ticker: str,
+    period: Optional[str] = None,
+    interval: str = "1d",
+    start: Optional[Union[str, datetime]] = None,
+    end: Optional[Union[str, datetime]] = None,
+    max_retries: int = 3
+) -> Optional[pd.DataFrame]:
+    """Robust stock history fetcher with fallback strategies"""
+    if not YFINANCE_AVAILABLE:
+        return None
+    
+    # Convert datetime objects to strings if needed
+    start_str = start.strftime('%Y-%m-%d') if isinstance(start, datetime) else start
+    end_str = end.strftime('%Y-%m-%d') if isinstance(end, datetime) else end
+    
+    # Strategy 1: Try without proxy first
+    for attempt in range(max_retries):
+        try:
+            yf.set_config(proxy=None)
+            ticker_obj = yf.Ticker(ticker)
+            time.sleep(0.1 * (attempt + 1))  # Progressive delay
+            
+            if start_str and end_str:
+                hist = ticker_obj.history(start=start_str, end=end_str, interval=interval, timeout=15)
+            elif period:
+                hist = ticker_obj.history(period=period, interval=interval, timeout=15)
+            else:
+                return None
+                
+            if hist is not None and not hist.empty and len(hist) > 0:
+                return hist
+                
+        except Exception as e:
+            if st.session_state.get('debug_mode', False) and attempt == max_retries - 1:
+                st.warning(f"History fetch failed for {ticker}: {str(e)[:100]}")
+            time.sleep(0.5 * (attempt + 1))
+    
+    # Strategy 2: Try with proxy if no-proxy failed
+    if PROXY_AVAILABLE:
+        for attempt in range(2):
+            try:
+                proxy = get_proxy_dict(probability=1.0)
+                if proxy:
+                    yf.set_config(proxy=proxy)
+                    ticker_obj = yf.Ticker(ticker)
+                    time.sleep(0.3)
+                    
+                    if start_str and end_str:
+                        hist = ticker_obj.history(start=start_str, end=end_str, interval=interval, timeout=20)
+                    elif period:
+                        hist = ticker_obj.history(period=period, interval=interval, timeout=20)
+                    else:
+                        return None
+                        
+                    if hist is not None and not hist.empty and len(hist) > 0:
+                        return hist
+            except Exception:
+                time.sleep(1.0)
+    
+    return None
+
+def fetch_multiple_stock_info_robust(tickers: List[str], max_workers: int = 3) -> Dict[str, Optional[Dict]]:
+    """Fetch stock info for multiple tickers with controlled parallelism and rate limiting"""
+    results = {}
+    total_tickers = len(tickers)
+    
+    # Process in smaller batches to avoid rate limiting
+    batch_size = 5
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (total_tickers + batch_size - 1) // batch_size
+        
+        if st.session_state.get('debug_mode', False):
+            st.info(f"Processing batch {batch_num}/{total_batches}: {', '.join(batch)}")
+        
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(batch))) as executor:
+            future_to_ticker = {
+                executor.submit(fetch_stock_info_robust, ticker): ticker 
+                for ticker in batch
+            }
+            
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    result = future.result(timeout=30)
+                    results[ticker] = result
+                    if st.session_state.get('debug_mode', False):
+                        status = "✓" if result else "✗"
+                        st.write(f"{status} {ticker}")
+                except Exception as exc:
+                    results[ticker] = None
+                    if st.session_state.get('debug_mode', False):
+                        st.warning(f"✗ {ticker}: {str(exc)[:100]}")
+        
+        # Add delay between batches
+        if i + batch_size < len(tickers):
+            time.sleep(1.0)
+    
+    # Summary
+    successful = sum(1 for v in results.values() if v is not None)
+    if st.session_state.get('debug_mode', False):
+        st.success(f"Successfully fetched data for {successful}/{total_tickers} tickers")
+    
+    return results
+
+# Fallback data handling
+def get_fallback_stock_data(ticker: str) -> Optional[Dict]:
+    """Provide basic fallback data when all fetching methods fail"""
+    # This could be expanded to use alternative data sources
+    # For now, provide minimal structure to prevent complete failures
+    return {
+        'shortName': ticker,
+        'currentPrice': None,
+        'marketCap': None,
+        'trailingPE': None,
+        'beta': None,
+        'sector': 'Unknown',
+        'industry': 'Unknown',
+        'quoteType': 'EQUITY'
+    }
+
+def validate_stock_data(data: Optional[Dict], ticker: str) -> Dict:
+    """Validate and clean stock data, providing fallbacks for missing fields"""
+    if not data:
+        return get_fallback_stock_data(ticker)
+    
+    # Ensure required fields exist
+    required_fields = {
+        'shortName': ticker,
+        'currentPrice': None,
+        'marketCap': None,
+        'trailingPE': None,
+        'beta': None,
+        'sector': 'Unknown',
+        'industry': 'Unknown',
+        'quoteType': 'EQUITY'
+    }
+    
+    for field, default in required_fields.items():
+        if field not in data or data[field] is None or data[field] == '':
+            data[field] = default
+    
+    return data
 
 if __name__ == "__main__":
     main()
