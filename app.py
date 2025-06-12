@@ -232,7 +232,11 @@ def fetch_stock_info(ticker: str) -> Optional[Dict]:
         
     proxy = get_proxy_dict()
     try:
-        ticker_obj = yf.Ticker(ticker, proxy=proxy)
+        if proxy:
+            yf.set_config(proxy=proxy)
+        else:
+            yf.set_config(proxy=None)
+        ticker_obj = yf.Ticker(ticker)
         info = ticker_obj.info
         if not info or "quoteType" not in info:
             return None
@@ -257,7 +261,11 @@ def fetch_stock_history(
         
     proxy = get_proxy_dict()
     try:
-        ticker_obj = yf.Ticker(ticker, proxy=proxy)
+        if proxy:
+            yf.set_config(proxy=proxy)
+        else:
+            yf.set_config(proxy=None)
+        ticker_obj = yf.Ticker(ticker)
         
         # Convert datetime objects to strings if needed
         start_str = start.strftime('%Y-%m-%d') if isinstance(start, datetime) else start
@@ -292,7 +300,11 @@ def fetch_financial_statement(
         
     proxy = get_proxy_dict()
     try:
-        ticker_obj = yf.Ticker(ticker, proxy=proxy)
+        if proxy:
+            yf.set_config(proxy=proxy)
+        else:
+            yf.set_config(proxy=None)
+        ticker_obj = yf.Ticker(ticker)
         
         if statement_type == "balance":
             data = ticker_obj.balance_sheet if period == "Annual" else ticker_obj.quarterly_balance_sheet
@@ -1713,17 +1725,17 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
             weights = np.array([1/len(tickers)] * len(tickers))  # Equal weights if not provided
         portfolio_value = portfolio_df.dot(weights)
         # Fetch SPY data
-        spy_data = fetch_stock_history(
-            "SPY",
-            start=start_date,
-            end=end_date
-        )
+        if proxy:
+            yf.set_config(proxy=proxy)
+        else:
+            yf.set_config(proxy=None)
+        spy_data = yf.Ticker("SPY")
         if spy_data is None or spy_data.empty:
             st.error("Could not fetch S&P 500 data")
             return
         # Normalize both series to 100
         portfolio_normalized = portfolio_value / portfolio_value.iloc[0] * 100
-        spy_normalized = spy_data['Close'] / spy_data['Close'].iloc[0] * 100
+        spy_normalized = spy_data.history(period="1d")['Close'] / spy_data.history(period="1d")['Close'].iloc[0] * 100
         # --- Tabs for main chart and yearly breakdown ---
         tab1, tab2 = st.tabs(["Performance Chart", "Yearly Performance Breakdown"])
         with tab1:
@@ -2672,7 +2684,11 @@ def fetch_stock_info_with_retry(ticker: str, max_retries: int = 3, delay: float 
     for attempt in range(max_retries):
         proxy = get_proxy_dict()
         try:
-            ticker_obj = yf.Ticker(ticker, proxy=proxy)
+            if proxy:
+                yf.set_config(proxy=proxy)
+            else:
+                yf.set_config(proxy=None)
+            ticker_obj = yf.Ticker(ticker)
             info = ticker_obj.info
             if info and "quoteType" in info:
                 return info
@@ -2734,7 +2750,11 @@ def fetch_stock_history_enhanced(
     for attempt in range(max_retries):
         try:
             proxy = get_proxy_dict_enhanced(probability=0.3)
-            ticker_obj = yf.Ticker(ticker, proxy=proxy)
+            if proxy:
+                yf.set_config(proxy=proxy)
+            else:
+                yf.set_config(proxy=None)
+            ticker_obj = yf.Ticker(ticker)
             time.sleep(0.5 + random.random())  # Add small delay between requests
             if start and end:
                 hist = ticker_obj.history(
