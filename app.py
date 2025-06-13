@@ -4,15 +4,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 import plotly.graph_objs as go
 import plotly.express as px
-from collections import Counter
-import traceback
-import concurrent.futures
-from functools import lru_cache
-from numbers import Number
 from typing import Tuple, Dict, List, Optional, Union
 import random
 import matplotlib
-import plotly.colors
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -54,24 +48,10 @@ st.set_page_config(
 )
 
 # Initialize session state
-if 'financial_data_cache' not in st.session_state:
-    st.session_state['financial_data_cache'] = {}
 if 'portfolio_created' not in st.session_state:
     st.session_state['portfolio_created'] = False
-if 'show_charts' not in st.session_state:
-    st.session_state['show_charts'] = False
-if 'show_financials' not in st.session_state:
-    st.session_state['show_financials'] = False
-if 'show_monte_carlo' not in st.session_state:
-    st.session_state['show_monte_carlo'] = False
-if 'show_market_overview' not in st.session_state:
-    st.session_state['show_market_overview'] = False
-if 'custom_weight_inputs' not in st.session_state:
-    st.session_state['custom_weight_inputs'] = {}
 if 'debug_mode' not in st.session_state:
     st.session_state['debug_mode'] = False
-if 'selected_timeframe' not in st.session_state:
-    st.session_state['selected_timeframe'] = '1M'
 if 'risk_level' not in st.session_state:
     st.session_state['risk_level'] = 'Moderate'
 
@@ -102,6 +82,27 @@ st.markdown("""
         width: 100%;
     }
     
+    /* Enhanced styling */
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .portfolio-header {
+        background: linear-gradient(90deg, #4CAF50, #2196F3);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: bold;
+    }
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        transition: all 0.3s ease;
+    }
+    
     /* Tooltip styling */
     .tooltip {
         position: relative;
@@ -127,39 +128,6 @@ st.markdown("""
         visibility: visible;
         opacity: 1;
     }
-    .company-info-metrics .element-container {font-size: 0.92em !important;}
-</style>
-""", unsafe_allow_html=True)
-
-# Add custom CSS for enhanced styling
-st.markdown('''
-<style>
-.metric-card {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    border-radius: 12px;
-    padding: 1.5rem;
-    margin: 1rem 0;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-}
-.portfolio-header {
-    background: linear-gradient(90deg, #4CAF50, #2196F3);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-weight: bold;
-}
-.stButton > button:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-    transition: all 0.3s ease;
-}
-</style>
-''', unsafe_allow_html=True)
-
-# Add custom CSS for tooltips
-st.markdown('''
-<style>
-    /* Tooltip styling for dataframe cells */
     .stDataFrame [title] {
         position: relative;
     }
@@ -177,8 +145,9 @@ st.markdown('''
         white-space: nowrap;
         z-index: 1000;
     }
+    .company-info-metrics .element-container {font-size: 0.92em !important;}
 </style>
-''', unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # Helper Functions
 def format_value(value: Union[float, int], prefix: str = "$", suffix: str = "", decimals: int = 2) -> str:
@@ -225,108 +194,11 @@ def get_period_from_timeframe(timeframe: str) -> tuple:
     }
     return timeframe_map.get(timeframe, ('1mo', '1d'))
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_stock_info(ticker: str) -> Optional[Dict]:
-    """Fetch stock information with proxy rotation"""
-    if not YFINANCE_AVAILABLE:
-        st.error("yfinance is required for this feature")
-        return None
-        
-    proxy = get_proxy_dict()
-    try:
-        if proxy:
-            yf.set_config(proxy=proxy)
-        else:
-            yf.set_config(proxy=None)
-        ticker_obj = yf.Ticker(ticker)
-        info = ticker_obj.info
-        if not info or "quoteType" not in info:
-            return None
-        return info
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error fetching info for {ticker}: {str(e)}")
-        return None
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_stock_history(
-    ticker: str,
-    period: Optional[str] = None,
-    interval: str = "1d",
-    start: Optional[Union[str, datetime]] = None,
-    end: Optional[Union[str, datetime]] = None
-) -> Optional[pd.DataFrame]:
-    """Fetch historical stock data with proxy rotation"""
-    if not YFINANCE_AVAILABLE:
-        st.error("yfinance is required for this feature")
-        return None
-        
-    proxy = get_proxy_dict()
-    try:
-        if proxy:
-            yf.set_config(proxy=proxy)
-        else:
-            yf.set_config(proxy=None)
-        ticker_obj = yf.Ticker(ticker)
-        
-        # Convert datetime objects to strings if needed
-        start_str = start.strftime('%Y-%m-%d') if isinstance(start, datetime) else start
-        end_str = end.strftime('%Y-%m-%d') if isinstance(end, datetime) else end
-        
-        if start_str and end_str:
-            hist = ticker_obj.history(start=start_str, end=end_str, interval=interval)
-        elif period:
-            hist = ticker_obj.history(period=period, interval=interval)
-        else:
-            return None
-            
-        if hist.empty:
-            return None
-            
-        return hist
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error fetching history for {ticker}: {str(e)}")
-        return None
 
-@st.cache_data(ttl=86400)  # Cache for 24 hours
-def fetch_financial_statement(
-    ticker: str,
-    statement_type: str,
-    period: str = "Annual"
-) -> Optional[pd.DataFrame]:
-    """Fetch financial statements with proxy rotation"""
-    if not YFINANCE_AVAILABLE:
-        st.error("yfinance is required for this feature")
-        return None
-        
-    proxy = get_proxy_dict()
-    try:
-        if proxy:
-            yf.set_config(proxy=proxy)
-        else:
-            yf.set_config(proxy=None)
-        ticker_obj = yf.Ticker(ticker)
-        
-        if statement_type == "balance":
-            data = ticker_obj.balance_sheet if period == "Annual" else ticker_obj.quarterly_balance_sheet
-        elif statement_type == "income":
-            data = ticker_obj.income_stmt if period == "Annual" else ticker_obj.quarterly_income_stmt
-        elif statement_type == "cashflow":
-            data = ticker_obj.cashflow if period == "Annual" else ticker_obj.quarterly_cashflow
-        else:
-            return None
-            
-        if data is None or data.empty:
-            return None
-            
-        # Filter out columns with too many NaN values
-        return data.loc[:, data.isna().mean() < 0.5]
-        
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error fetching {statement_type} for {ticker}: {str(e)}")
-        return None
+
+
+
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def fetch_market_data(url: str) -> Optional[pd.DataFrame]:
@@ -500,7 +372,7 @@ def fetch_sp500_tickers() -> List[str]:
 
 def get_asset_price_change(ticker: str, period: str = "1mo") -> Optional[Dict[str, float]]:
     """Fetch asset's current price and % change over the given period."""
-    df = fetch_stock_history(ticker, period=period)
+    df = fetch_stock_history_robust(ticker, period=period)
     if df is not None and not df.empty:
         start = df['Close'].iloc[0]
         end = df['Close'].iloc[-1]
@@ -511,176 +383,9 @@ def get_asset_price_change(ticker: str, period: str = "1mo") -> Optional[Dict[st
         }
     return None
 
-def plot_gauge(value: float, min_val: float, max_val: float, title: str) -> go.Figure:
-    """Create a gauge chart"""
-    try:
-        fig = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=value,
-            domain={'x': [0, 1], 'y': [0, 1]},
-            gauge={
-                'axis': {'range': [min_val, max_val]},
-                'bar': {'color': "darkblue"},
-                'steps': [
-                    {'range': [min_val, max_val/2], 'color': "lightgray"},
-                    {'range': [max_val/2, max_val], 'color': "gray"}
-                ]
-            },
-            title={'text': title}
-        ))
-        return fig
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error creating gauge chart: {str(e)}")
-        return None
 
-def plot_candles_stick_bar(data: pd.DataFrame, title: str) -> go.Figure:
-    """Create a candlestick chart"""
-    try:
-        fig = go.Figure(data=[go.Candlestick(
-            x=data.index,
-            open=data['Open'],
-            high=data['High'],
-            low=data['Low'],
-            close=data['Close']
-        )])
-        
-        fig.update_layout(
-            title=title,
-            yaxis_title='Price',
-            xaxis_title='Date',
-            height=400
-        )
-        
-        return fig
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error creating candlestick chart: {str(e)}")
-        return None
 
-def info_table(info: Dict) -> pd.DataFrame:
-    """Create a formatted info table from stock info"""
-    try:
-        if not info:
-            return None
-            
-        # Select relevant fields
-        fields = {
-            'shortName': 'Name',
-            'symbol': 'Symbol',
-            'marketCap': 'Market Cap',
-            'trailingPE': 'P/E Ratio',
-            'forwardPE': 'Forward P/E',
-            'dividendYield': 'Dividend Yield',
-            'beta': 'Beta',
-            'fiftyTwoWeekHigh': '52W High',
-            'fiftyTwoWeekLow': '52W Low',
-            'averageVolume': 'Avg Volume'
-        }
-        
-        # Create table
-        data = {display: info.get(field) for field, display in fields.items()}
-        df = pd.DataFrame([data])
-        
-        # Format values
-        if 'Market Cap' in df.columns:
-            df['Market Cap'] = df['Market Cap'].apply(lambda x: format_value(x) if pd.notnull(x) else 'N/A')
-        if 'Dividend Yield' in df.columns:
-            df['Dividend Yield'] = df['Dividend Yield'].apply(lambda x: f"{x*100:.2f}%" if pd.notnull(x) else 'N/A')
-        if 'Avg Volume' in df.columns:
-            df['Avg Volume'] = df['Avg Volume'].apply(lambda x: format_value(x, prefix='', suffix='', decimals=0) if pd.notnull(x) else 'N/A')
-        
-        return df
-        
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error creating info table: {str(e)}")
-        return None
 
-def top_table(data: pd.DataFrame, n: int = 5) -> pd.DataFrame:
-    """Create a top N table from DataFrame"""
-    try:
-        if data is None or data.empty:
-            return None
-        return data.head(n)
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error creating top table: {str(e)}")
-        return None
-
-def analyze_portfolio(tickers: List[str]):
-    """Analyze portfolio with basic info using selected year range"""
-    with st.spinner("Analyzing portfolio..."):
-        start_date = st.session_state.get('start_date')
-        end_date = st.session_state.get('end_date')
-        
-        # Calculate per-ticker metrics
-        returns = []
-        volatilities = []
-        change_pcts = []
-        current_prices = []
-        market_caps = []
-        pe_ratios = []
-        betas = []
-        names = []
-        
-        for ticker in tickers:
-            info = fetch_stock_info(ticker)
-            hist = fetch_stock_history(
-                ticker,
-                start=start_date,
-                end=end_date
-            )
-            
-            if info and hist is not None and not hist.empty:
-                # Calculate metrics
-                daily_returns = hist["Close"].pct_change().dropna()
-                annual_return = (1 + daily_returns.mean()) ** 252 - 1
-                annual_volatility = daily_returns.std() * (252 ** 0.5)
-                
-                start_price = hist["Close"].iloc[0]
-                end_price = hist["Close"].iloc[-1]
-                pct_change = ((end_price - start_price) / start_price) * 100
-                
-                # Store metrics
-                returns.append(annual_return)
-                volatilities.append(annual_volatility)
-                change_pcts.append(pct_change)
-                current_prices.append(end_price)
-                market_caps.append(info.get('marketCap'))
-                pe_ratios.append(info.get('trailingPE'))
-                betas.append(info.get('beta'))
-                names.append(info.get('shortName', 'N/A'))
-            else:
-                # Handle missing data
-                returns.append(None)
-                volatilities.append(None)
-                change_pcts.append(None)
-                current_prices.append(None)
-                market_caps.append(None)
-                pe_ratios.append(None)
-                betas.append(None)
-                names.append('N/A')
-        
-        # Create portfolio data DataFrame
-        portfolio_data = pd.DataFrame({
-            'Ticker': tickers,
-            'Name': names,
-            'Current Price': [f"${price:.2f}" if price else 'N/A' for price in current_prices],
-            'Expected Return': [f"{ret*100:.2f}%" if ret else 'N/A' for ret in returns],
-            'Volatility': [f"{vol*100:.2f}%" if vol else 'N/A' for vol in volatilities],
-            'Change %': [f"{chg:.2f}%" if chg else 'N/A' for chg in change_pcts],
-            'Market Cap': [format_value(mc) if mc else 'N/A' for mc in market_caps],
-            'P/E Ratio': [f"{pe:.2f}" if pe else 'N/A' for pe in pe_ratios],
-            'Beta': [f"{beta:.2f}" if beta else 'N/A' for beta in betas]
-        })
-        
-        if not portfolio_data.empty:
-            st.dataframe(portfolio_data, use_container_width=True)
-            return True, portfolio_data
-        else:
-            st.error("Could not fetch data for any stocks in the portfolio")
-            return False, None
 
 def get_optimized_weights(mean_returns, cov_matrix, risk_level):
     """Optimize portfolio weights based on risk level using modern portfolio theory."""
@@ -827,7 +532,7 @@ def display_optimal_portfolio(tickers: List[str]):
     
     # Display allocation details
     if weights is not None:
-        # --- Robust parallel info fetching ---
+        # Robust parallel info fetching
         with st.spinner("Fetching company info for all tickers..."):
             raw_info_dict = fetch_multiple_stock_info_robust(tickers, max_workers=3)
             # Validate, enrich, and clean the data
@@ -919,7 +624,7 @@ def display_optimal_portfolio(tickers: List[str]):
             <b>Change %:</b> Total percentage change since start date (higher is better)
         </div>
         ''', unsafe_allow_html=True)
-        # --- Pie charts in columns ---
+        # Pie charts in columns
         col1, col2 = st.columns(2)
         with col1:
             fig = px.pie(
@@ -1338,69 +1043,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
     with tab4:
         display_market_overview()
 
-def get_market_indicators() -> Dict[str, Dict[str, Union[float, str]]]:
-    """Fetch key market indicators including S&P 500, VIX, and Treasury yields"""
-    try:
-        indicators = {}
-        
-        # Fetch SPY data for S&P 500
-        spy_data = fetch_stock_history_robust("SPY", period="1d")
-        if spy_data is not None and not spy_data.empty:
-            spy_close = spy_data['Close'].iloc[-1]
-            spy_change = ((spy_close - spy_data['Open'].iloc[0]) / spy_data['Open'].iloc[0]) * 100
-            indicators['S&P 500'] = {
-                'value': spy_close,
-                'change': spy_change,
-                'change_pct': f"{spy_change:+.2f}%",
-                'icon': "🟢" if spy_change >= 0 else "🔴"
-            }
-        
-        # Fetch VIX data
-        vix_data = fetch_stock_history_robust("^VIX", period="1d")
-        if vix_data is not None and not vix_data.empty:
-            vix_close = vix_data['Close'].iloc[-1]
-            vix_change = ((vix_close - vix_data['Open'].iloc[0]) / vix_data['Open'].iloc[0]) * 100
-            indicators['VIX'] = {
-                'value': vix_close,
-                'change': vix_change,
-                'change_pct': f"{vix_change:+.2f}%",
-                'icon': "🔴" if vix_change >= 0 else "🟢"  # Inverse for VIX
-            }
-        
-        # Fetch 10Y Treasury Yield
-        treasury_data = fetch_stock_history_robust("^TNX", period="1d")
-        if treasury_data is not None and not treasury_data.empty:
-            treasury_close = treasury_data['Close'].iloc[-1]
-            treasury_change = ((treasury_close - treasury_data['Open'].iloc[0]) / treasury_data['Open'].iloc[0]) * 100
-            indicators['10Y Yield'] = {
-                'value': treasury_close,
-                'change': treasury_change,
-                'change_pct': f"{treasury_change:+.2f}%",
-                'icon': "🟢" if treasury_change >= 0 else "🔴"
-            }
-        
-        return indicators
-        
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Error fetching market indicators: {str(e)}")
-        return {}
 
-def create_metric_card(title, value, change, color):
-    return f"""
-    <div style="
-        background: linear-gradient(135deg, {color}22, {color}11);
-        border-left: 4px solid {color};
-        padding: 1rem;
-        border-radius: 8px;
-        margin: 0.5rem 0;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    ">
-        <h4 style="margin: 0; color: {color};">{title}</h4>
-        <h2 style="margin: 0.5rem 0;">{value}</h2>
-        <p style="margin: 0; font-size: 0.9rem; color: {color};">{change}</p>
-    </div>
-    """
 
 def get_spy_status_icon_and_label(change_pct: float, timeframe: str) -> Tuple[str, str]:
     """Determine SPY status icon and label based on performance and timeframe."""
@@ -1496,7 +1139,7 @@ def display_market_overview():
     st.markdown("### Key Market Indicators")
     col1, col2, col3 = st.columns(3)
     
-    # --- SPY (S&P 500) ---
+    # SPY (S&P 500)
     with col1:
         # Dynamic tooltip content based on timeframe
         timeframe_tooltips = {
@@ -1572,7 +1215,7 @@ def display_market_overview():
         else:
             st.warning("No SPY data available")
 
-    # --- VIX ---
+            # VIX
     with col2:
         st.markdown("""
         <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 5px;">
@@ -1617,7 +1260,7 @@ def display_market_overview():
         else:
             st.warning("No VIX data available")
 
-    # --- 10-Year Treasury Yield ---
+            # 10-Year Treasury Yield
     with col3:
         st.markdown("""
         <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 5px;">
@@ -1732,7 +1375,7 @@ def display_market_overview():
         st.markdown("#### Cryptocurrency Performance")
         render_assets(crypto)
 
-    # --- Sector Performance ---
+    # Sector Performance
     st.markdown("### Sector Performance")
     with st.spinner("Loading sector performance..."):
         sector_df = fetch_sector_performance()
@@ -1825,7 +1468,7 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
         # Normalize both series to 100
         portfolio_normalized = portfolio_value / portfolio_value.iloc[0] * 100
         spy_normalized = spy_hist['Close'] / spy_hist['Close'].iloc[0] * 100
-        # --- Tabs for main chart and yearly breakdown ---
+        # Tabs for main chart and yearly breakdown
         tab1, tab2 = st.tabs(["Performance Chart", "📊 Yearly Performance Breakdown"])
         with tab1:
             # Create comparison chart
@@ -2195,56 +1838,7 @@ def display_financial_analysis(df: pd.DataFrame, statement_type: str, base_metri
     else:
         st.warning(f"Could not calculate vertical analysis. Base metric '{base_metric}' not found or insufficient data.")
 
-# Add helper functions for ratio calculations
-def current_ratio(current_assets, current_liabilities):
-    """Calculate current ratio with safe division."""
-    return current_assets / current_liabilities if current_liabilities else None
 
-def quick_ratio(current_assets, inventory, current_liabilities):
-    """Calculate quick ratio with safe division."""
-    return (current_assets - inventory) / current_liabilities if current_liabilities else None
-
-def working_capital(current_assets, current_liabilities):
-    """Calculate working capital with safe subtraction."""
-    return current_assets - current_liabilities if current_assets is not None and current_liabilities is not None else None
-
-def gross_margin(gross_profit, revenue):
-    """Calculate gross margin with safe division."""
-    return gross_profit / revenue if revenue else None
-
-def operating_margin(operating_income, revenue):
-    """Calculate operating margin with safe division."""
-    return operating_income / revenue if revenue else None
-
-def net_margin(net_income, revenue):
-    """Calculate net margin with safe division."""
-    return net_income / revenue if revenue else None
-
-def return_on_assets(net_income, total_assets):
-    """Calculate ROA with safe division."""
-    return net_income / total_assets if total_assets else None
-
-def return_on_equity(net_income, equity):
-    """Calculate ROE with safe division."""
-    return net_income / equity if equity else None
-
-def dso(avg_receivables, revenue):
-    """Calculate Days Sales Outstanding with safe division."""
-    return (avg_receivables / revenue) * 365 if avg_receivables is not None and revenue else None
-
-def dpo(avg_payables, purchases):
-    """Calculate Days Payable Outstanding with safe division."""
-    return (avg_payables / purchases) * 365 if avg_payables is not None and purchases else None
-
-def dio(avg_inventory, cogs):
-    """Calculate Days Inventory Outstanding with safe division."""
-    return (avg_inventory / cogs) * 365 if avg_inventory is not None and cogs else None
-
-def cash_conversion_cycle(dso_val, dio_val, dpo_val):
-    """Calculate Cash Conversion Cycle with safe addition/subtraction."""
-    if dso_val is not None and dio_val is not None and dpo_val is not None:
-        return dso_val + dio_val - dpo_val
-    return None
 
 def calculate_financial_ratios(income_stmt: pd.DataFrame, balance_sheet: pd.DataFrame, cash_flow: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     """Calculate key financial ratios from financial statements with improved accuracy."""
@@ -2730,10 +2324,7 @@ def display_ratio_insights(ratios: dict, year: str):
                 else:
                     st.success("🟢 Conservative (<0.3)")
     
-    # Industry Comparison Section
-    st.markdown("---")
-    st.markdown("#### 🏭 Industry Benchmark Comparison")
-    st.warning("Industry benchmark data coming soon! We'll soon add comparison against sector averages.")
+
 
 def monte_carlo_simulation(start_value: float, mean_return: float, volatility: float, 
                           years: int = 10, simulations: int = 500, steps_per_year: int = 252) -> np.ndarray:
@@ -2764,149 +2355,9 @@ def monte_carlo_simulation(start_value: float, mean_return: float, volatility: f
         
     return results
 
-def calculate_annual_returns(close_prices: pd.DataFrame, weights: np.ndarray) -> pd.Series:
-    """Calculate annual returns for the portfolio"""
-    # Resample to yearly closing prices
-    yearly_prices = close_prices.resample('Y').last()
-    # Calculate yearly returns
-    yearly_returns = yearly_prices.pct_change().dropna()
-    # Calculate weighted portfolio returns
-    port_returns = (yearly_returns * weights).sum(axis=1)
-    return port_returns
 
-def fetch_stock_info_with_retry(ticker: str, max_retries: int = 3, delay: float = 1.0) -> Optional[Dict]:
-    """Fetch stock info with proxy rotation and retry logic."""
-    for attempt in range(max_retries):
-        proxy = get_proxy_dict()
-        try:
-            if proxy:
-                yf.set_config(proxy=proxy)
-            else:
-                yf.set_config(proxy=None)
-            ticker_obj = yf.Ticker(ticker)
-            info = ticker_obj.info
-            if info and "quoteType" in info:
-                return info
-            # Fallback to fast_info
-            fast_info = getattr(ticker_obj, "fast_info", None)
-            if fast_info:
-                return fast_info
-        except Exception as e:
-            if st.session_state.get('debug_mode', False):
-                st.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
-        time.sleep(delay * (2 ** attempt))  # Exponential backoff
-    return None
 
-def fetch_all_stock_info(tickers: List[str], max_workers: int = 5) -> Dict[str, Optional[Dict]]:
-    """Fetch info for all tickers in parallel with retry and proxy rotation."""
-    results = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ticker = {executor.submit(fetch_stock_info_with_retry, ticker): ticker for ticker in tickers}
-        for future in as_completed(future_to_ticker):
-            ticker = future_to_ticker[future]
-            try:
-                results[ticker] = future.result()
-            except Exception as exc:
-                results[ticker] = None
-    return results
 
-def get_cached_stock_info(ticker: str) -> Optional[Dict]:
-    """Get stock info from session cache or fetch if not present."""
-    cache = st.session_state.setdefault('stock_info_cache', {})
-    if ticker in cache:
-        return cache[ticker]
-    info = fetch_stock_info_with_retry(ticker)
-    cache[ticker] = info
-    return info
-
-def get_proxy_dict_enhanced(probability=0.3, max_retries=2):
-    """Improved proxy fetcher with fallback"""
-    if not PROXY_AVAILABLE or random.random() > probability:
-        return None
-    for _ in range(max_retries):
-        try:
-            proxy = FreeProxy(rand=True, timeout=5).get()
-            if proxy:
-                return {"http": proxy, "https": proxy}
-        except Exception:
-            continue
-    return None
-
-# Enhanced stock history fetcher with retry, delay, and proxy fallback
-def fetch_stock_history_enhanced(
-    ticker,
-    period=None,
-    interval="1d",
-    start=None,
-    end=None,
-    max_retries=3
-):
-    """Improved stock history fetcher with retry logic"""
-    for attempt in range(max_retries):
-        try:
-            proxy = get_proxy_dict_enhanced(probability=0.3)
-            if proxy:
-                yf.set_config(proxy=proxy)
-            else:
-                yf.set_config(proxy=None)
-            ticker_obj = yf.Ticker(ticker)
-            time.sleep(0.5 + random.random())  # Add small delay between requests
-            if start and end:
-                hist = ticker_obj.history(
-                    start=start.strftime('%Y-%m-%d') if isinstance(start, datetime) else start,
-                    end=end.strftime('%Y-%m-%d') if isinstance(end, datetime) else end,
-                    interval=interval,
-                    timeout=10
-                )
-            elif period:
-                hist = ticker_obj.history(
-                    period=period,
-                    interval=interval,
-                    timeout=10
-                )
-            else:
-                return None
-            if hist is not None and not hist.empty:
-                return hist
-        except Exception as e:
-            if attempt == max_retries - 1:
-                if st.session_state.get('debug_mode', False):
-                    st.error(f"Final attempt failed for {ticker}: {str(e)}")
-            time.sleep(2 ** attempt)  # Exponential backoff
-    return None
-
-# Caching strategy improvements for stock info
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_stock_info_cached(ticker):
-    """Cached version with better error handling"""
-    try:
-        info = fetch_stock_info_with_retry(ticker)
-        if not info or "quoteType" not in info:
-            return None
-        return info
-    except Exception as e:
-        if st.session_state.get('debug_mode', False):
-            st.error(f"Cache error for {ticker}: {str(e)}")
-        return None
-
-# Parallel fetching for multiple stocks with rate control
-def fetch_multiple_stocks_parallel(tickers, max_workers=4):
-    """Fetch multiple stocks with controlled parallelism"""
-    results = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ticker = {
-            executor.submit(fetch_stock_history_enhanced, ticker): ticker 
-            for ticker in tickers
-        }
-        for future in as_completed(future_to_ticker):
-            ticker = future_to_ticker[future]
-            try:
-                results[ticker] = future.result()
-            except Exception as exc:
-                results[ticker] = None
-                if st.session_state.get('debug_mode', False):
-                    st.warning(f"{ticker} generated an exception: {exc}")
-    return results
 
 # Main App Content
 def main():
@@ -3037,7 +2488,7 @@ def main():
         else:
             st.success("✅ Weights sum to 100%")
     
-    # --- Year Range Selection ---
+    # Year Range Selection
     current_year = datetime.today().year
     year_options = list(range(2010, current_year + 1))
     
@@ -3112,29 +2563,9 @@ def main():
         # Create and display chart using selected timeframe
         create_portfolio_chart(tickers, chart_timeframe)
 
-# Gradient-based color formatting for DataFrame
 
-def gradient_performance(val, positive_is_good=True):
-    """Apply conditional formatting with red-yellow-green gradient"""
-    if isinstance(val, str) and '%' in val:
-        try:
-            num = float(val.replace('%', '').replace('+', ''))
-            if positive_is_good:
-                # For metrics where higher is better (returns, change %)
-                norm = min(max((num + 100) / 200, 0), 1)
-                color = matplotlib.colors.rgb2hex(matplotlib.cm.RdYlGn(norm))
-            else:
-                # For metrics where lower is better (volatility)
-                norm = min(max(num / 100, 0), 1)
-                color = matplotlib.colors.rgb2hex(matplotlib.cm.RdYlGn_r(norm))
-            text_color = 'white' if norm > 0.7 or norm < 0.3 else 'black'
-            return f'background-color: {color}; color: {text_color}'
-        except:
-            pass
-    return ''
 
-# Enhanced data fetching with unified approach
-@st.cache_data(ttl=1800, show_spinner=False)  # 30 minutes cache
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]:
     """Robust stock info fetcher with multiple fallback strategies and comprehensive data validation"""
     if not YFINANCE_AVAILABLE:
@@ -3255,7 +2686,7 @@ def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]
     
     return None
 
-@st.cache_data(ttl=1800, show_spinner=False)  # 30 minutes cache
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stock_history_robust(
     ticker: str,
     period: Optional[str] = None,
@@ -3483,7 +2914,7 @@ def validate_stock_data(data: Optional[Dict], ticker: str) -> Dict:
     
     return validated_data
 
-@st.cache_data(ttl=86400, show_spinner=False)  # Cache for 24 hours
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_financial_statement_robust(
     ticker: str,
     statement_type: str,
