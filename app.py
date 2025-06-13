@@ -1998,10 +1998,18 @@ def calculate_financial_ratios(income_stmt: pd.DataFrame, balance_sheet: pd.Data
         else:  # decimal
             return f"{val:.2f}"
     
-    # Apply formatting
-    liquidity_ratios = liquidity_ratios.applymap(
-        lambda x: format_ratio(x, 'decimal' if x != 'Working Capital' else 'currency')
-    )
+    # Apply formatting with proper row-based logic
+    def format_liquidity_ratio(val, row_name):
+        if row_name == 'Working Capital':
+            return format_ratio(val, 'currency')
+        else:
+            return format_ratio(val, 'decimal')
+    
+    # Apply formatting row by row
+    for row_name in liquidity_ratios.index:
+        liquidity_ratios.loc[row_name] = liquidity_ratios.loc[row_name].apply(
+            lambda x: format_liquidity_ratio(x, row_name)
+        )
     profitability_ratios = profitability_ratios.applymap(
         lambda x: format_ratio(x, 'percentage')
     )
@@ -2100,6 +2108,11 @@ def display_ratio_insights(ratios: dict, year: str):
                             val = float(val_str.replace('%', '')) / 100
                         elif 'days' in val_str:
                             val = float(val_str.replace(' days', ''))
+                        elif '$' in val_str and ratio_name == 'Working Capital':
+                            # Handle Working Capital currency format: $1,234.56
+                            val = float(val_str.replace('$', '').replace(',', ''))
+                        elif val_str == 'N/A':
+                            val = None
                         else:
                             val = float(val_str)
                     else:
@@ -2151,8 +2164,10 @@ def display_ratio_insights(ratios: dict, year: str):
         # Working Capital
         wc = latest_ratios.get("Working Capital")
         with cols[2]:
+            # Format Working Capital as currency
+            wc_formatted = format_value(wc) if wc is not None else "N/A"
             st.metric("Working Capital", 
-                     fmt(wc) if wc is not None else "N/A",
+                     wc_formatted,
                      help="Current assets - current liabilities")
             if wc is not None:
                 if wc < 0:
