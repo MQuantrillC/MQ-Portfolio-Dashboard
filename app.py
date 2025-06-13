@@ -899,7 +899,7 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
         # Fetch historical data and calculate returns
         returns_data = {}
         for ticker in tickers:
-            hist = fetch_stock_history(ticker, start=start_date, end=end_date)
+            hist = fetch_stock_history_robust(ticker, start=start_date, end=end_date)
             if hist is not None and not hist.empty:
                 returns_data[ticker] = hist['Close'].pct_change().dropna()
         
