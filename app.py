@@ -224,8 +224,8 @@ def fetch_market_data(url: str) -> Optional[pd.DataFrame]:
         return None
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_sector_performance() -> Optional[pd.DataFrame]:
-    """Fetch sector performance data with proxy rotation"""
+def fetch_sector_performance(mo_period: Optional[str], mo_interval: str, market_tf: str) -> Optional[pd.DataFrame]:
+    """Fetch sector performance data with dynamic timeframe support"""
     if not YFINANCE_AVAILABLE:
         return None
         
@@ -243,13 +243,22 @@ def fetch_sector_performance() -> Optional[pd.DataFrame]:
         "XLRE": "Real Estate"
     }
     
+    # Create timeframe display mapping
+    timeframe_labels = {
+        "5D": "5-Day",
+        "1M": "1-Month", 
+        "6M": "6-Month",
+        "1Y": "1-Year",
+        "YTD": "Year-to-Date",
+        "5Y": "5-Year",
+        "10Y": "10-Year"
+    }
+    
     performance_data = []
     for etf, sector in sector_etfs.items():
-        hist = fetch_stock_history_robust(etf, period="1mo")
-        if hist is not None and not hist.empty:
-            start_price = hist["Close"].iloc[0]
-            end_price = hist["Close"].iloc[-1]
-            change_pct = ((end_price - start_price) / start_price) * 100
+        result = get_price_and_change_for_timeframe(etf, mo_period, mo_interval, market_tf)
+        if result is not None:
+            current_price, change_pct = result
             performance_data.append({
                 "Sector": sector,
                 "Change %": round(change_pct, 2),
@@ -261,20 +270,8 @@ def fetch_sector_performance() -> Optional[pd.DataFrame]:
         
     df = pd.DataFrame(performance_data).sort_values("Change %", ascending=False)
     
-    # Format the Change % column in the DataFrame with color coding
-    def color_change(val):
-        if val > 0:
-            return f"color: green; font-weight: bold;"
-        elif val < 0:
-            return f"color: red; font-weight: bold;"
-        return ""
-    
-    # Apply styling to the DataFrame
-    styled_df = df.style.applymap(color_change, subset=['Change %'])
-    styled_df = styled_df.format({'Change %': '{:.2f}%'})
-    
-    # Display the styled DataFrame
-    st.dataframe(styled_df, use_container_width=True)
+    # Get timeframe label for chart
+    timeframe_label = timeframe_labels.get(market_tf, market_tf)
     
     # Create a bar chart with green-to-red gradient
     fig = px.bar(
@@ -285,7 +282,7 @@ def fetch_sector_performance() -> Optional[pd.DataFrame]:
         color_continuous_scale=['red', 'lightgray', 'green'],  # Red to green
         color_continuous_midpoint=0,  # Neutral at 0%
         text='Change %',
-        labels={'Change %': '1 Month Change (%)'},
+        labels={'Change %': f'{timeframe_label} Change (%)'},
         hover_data={'ETF': True}
     )
     
@@ -312,9 +309,9 @@ def fetch_sector_performance() -> Optional[pd.DataFrame]:
     # Display the chart
     st.plotly_chart(fig, use_container_width=True)
     
-    # Add a note about the data source
-    st.caption("""
-        💡 Data based on SPDR sector ETFs. Performance shown is the 1-month percentage change.
+    # Add a note about the data source with dynamic timeframe
+    st.caption(f"""
+        💡 Data based on SPDR sector ETFs. Performance shown is the {timeframe_label.lower()} percentage change.
         ETFs used: XLK (Tech), XLF (Financials), XLV (Healthcare), XLE (Energy), XLI (Industrials),
         XLP (Staples), XLY (Discretionary), XLB (Materials), XLU (Utilities), XLRE (Real Estate)
     """)
@@ -322,17 +319,31 @@ def fetch_sector_performance() -> Optional[pd.DataFrame]:
     return df
 
 @st.cache_data(ttl=86400)  # Cache for 24 hours
-def fetch_sp500_tickers() -> List[str]:
-    """Fetch S&P 500 ticker symbols"""
+def fetch_sp500_tickers_with_names() -> Dict[str, str]:
+    """Fetch S&P 500 ticker symbols with company names"""
+    # Fallback dictionary of popular S&P 500 stocks with company names
+    fallback_data = {
+        'AAPL': 'Apple Inc.', 'MSFT': 'Microsoft Corporation', 'GOOGL': 'Alphabet Inc.', 
+        'AMZN': 'Amazon.com Inc.', 'NVDA': 'NVIDIA Corporation', 'TSLA': 'Tesla Inc.', 
+        'META': 'Meta Platforms Inc.', 'BRK-B': 'Berkshire Hathaway Inc.', 'UNH': 'UnitedHealth Group Inc.', 
+        'JNJ': 'Johnson & Johnson', 'JPM': 'JPMorgan Chase & Co.', 'V': 'Visa Inc.', 
+        'PG': 'Procter & Gamble Co.', 'XOM': 'Exxon Mobil Corporation', 'HD': 'Home Depot Inc.', 
+        'CVX': 'Chevron Corporation', 'MA': 'Mastercard Inc.', 'PFE': 'Pfizer Inc.', 
+        'ABBV': 'AbbVie Inc.', 'BAC': 'Bank of America Corp.', 'KO': 'Coca-Cola Co.', 
+        'AVGO': 'Broadcom Inc.', 'PEP': 'PepsiCo Inc.', 'TMO': 'Thermo Fisher Scientific Inc.', 
+        'COST': 'Costco Wholesale Corp.', 'DIS': 'Walt Disney Co.', 'ABT': 'Abbott Laboratories', 
+        'WMT': 'Walmart Inc.', 'CRM': 'Salesforce Inc.', 'MRK': 'Merck & Co. Inc.', 
+        'NFLX': 'Netflix Inc.', 'ADBE': 'Adobe Inc.', 'ACN': 'Accenture Plc', 
+        'NKE': 'Nike Inc.', 'LLY': 'Eli Lilly and Co.', 'DHR': 'Danaher Corporation', 
+        'TXN': 'Texas Instruments Inc.', 'NEE': 'NextEra Energy Inc.', 'VZ': 'Verizon Communications Inc.', 
+        'BMY': 'Bristol-Myers Squibb Co.', 'QCOM': 'QUALCOMM Inc.', 'PM': 'Philip Morris International Inc.', 
+        'T': 'AT&T Inc.', 'UPS': 'United Parcel Service Inc.', 'RTX': 'Raytheon Technologies Corp.', 
+        'SCHW': 'Charles Schwab Corp.', 'HON': 'Honeywell International Inc.', 'LOW': 'Lowe\'s Companies Inc.', 
+        'AMD': 'Advanced Micro Devices Inc.', 'AMGN': 'Amgen Inc.'
+    }
+    
     if not WEB_SCRAPING_AVAILABLE:
-        # Fallback list of popular S&P 500 stocks
-        return [
-            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK-B', 'UNH', 'JNJ',
-            'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'PFE', 'ABBV', 'BAC',
-            'KO', 'AVGO', 'PEP', 'TMO', 'COST', 'DIS', 'ABT', 'WMT', 'CRM', 'MRK',
-            'NFLX', 'ADBE', 'ACN', 'NKE', 'LLY', 'DHR', 'TXN', 'NEE', 'VZ', 'BMY',
-            'QCOM', 'PM', 'T', 'UPS', 'RTX', 'SCHW', 'HON', 'LOW', 'AMD', 'AMGN'
-        ]
+        return fallback_data
     
     try:
         # Try to fetch from Wikipedia
@@ -343,32 +354,43 @@ def fetch_sp500_tickers() -> List[str]:
         tables = pd.read_html(response.content)
         if tables and len(tables) > 0:
             df = tables[0]
-            # The first column usually contains the ticker symbols
-            if 'Symbol' in df.columns:
-                tickers = df['Symbol'].tolist()
-            elif len(df.columns) > 0:
-                tickers = df.iloc[:, 0].tolist()
-            else:
-                return []
             
-            # Clean up tickers
-            tickers = [str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()]
-            # Remove any invalid tickers
-            tickers = [t for t in tickers if t and len(t) <= 5 and t != 'NAN']
+            # Look for Symbol and Security columns
+            ticker_col = None
+            name_col = None
             
-            return sorted(tickers)
+            for col in df.columns:
+                if 'symbol' in col.lower():
+                    ticker_col = col
+                elif 'security' in col.lower() or 'company' in col.lower():
+                    name_col = col
+            
+            if ticker_col is not None and name_col is not None:
+                # Create dictionary mapping ticker to company name
+                ticker_name_dict = {}
+                for _, row in df.iterrows():
+                    ticker = str(row[ticker_col]).strip().upper()
+                    name = str(row[name_col]).strip()
+                    
+                    # Clean up ticker and name
+                    if ticker and len(ticker) <= 5 and ticker != 'NAN' and name and name != 'nan':
+                        ticker_name_dict[ticker] = name
+                
+                if ticker_name_dict:
+                    return ticker_name_dict
+                    
     except Exception as e:
         if st.session_state.get('debug_mode', False):
-            st.error(f"Error fetching S&P 500 tickers: {str(e)}")
+            st.error(f"Error fetching S&P 500 data: {str(e)}")
     
-    # Return fallback list if fetching fails
-    return [
-        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK-B', 'UNH', 'JNJ',
-        'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'PFE', 'ABBV', 'BAC',
-        'KO', 'AVGO', 'PEP', 'TMO', 'COST', 'DIS', 'ABT', 'WMT', 'CRM', 'MRK',
-        'NFLX', 'ADBE', 'ACN', 'NKE', 'LLY', 'DHR', 'TXN', 'NEE', 'VZ', 'BMY',
-        'QCOM', 'PM', 'T', 'UPS', 'RTX', 'SCHW', 'HON', 'LOW', 'AMD', 'AMGN'
-    ]
+    # Return fallback data if fetching fails
+    return fallback_data
+
+@st.cache_data(ttl=86400)  # Cache for 24 hours  
+def fetch_sp500_tickers() -> List[str]:
+    """Fetch S&P 500 ticker symbols (for backward compatibility)"""
+    ticker_name_dict = fetch_sp500_tickers_with_names()
+    return sorted(list(ticker_name_dict.keys()))
 
 def get_asset_price_change(ticker: str, period: str = "1mo") -> Optional[Dict[str, float]]:
     """Fetch asset's current price and % change over the given period."""
@@ -631,7 +653,7 @@ def display_optimal_portfolio(tickers: List[str]):
                 portfolio_data,
                 values=[float(w.strip('%')) for w in portfolio_data['Weight']],
                 names=portfolio_data['Ticker'],
-                title='🥧 Portfolio Allocation',
+                title='Portfolio Allocation',
                 hole=0.5,
                 color_discrete_sequence=px.colors.qualitative.Pastel
             )
@@ -662,7 +684,7 @@ def display_optimal_portfolio(tickers: List[str]):
                 sector_df,
                 values='Weight',
                 names='Sector',
-                title='🥧 Sector Allocation',
+                title='Sector Allocation',
                 hole=0.5,
                 color_discrete_sequence=px.colors.qualitative.Pastel
             )
@@ -707,10 +729,9 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
         start_date = end_date - timedelta(days=10*365)
         interval = '1mo'
     with st.spinner(f"Loading chart data for {timeframe}..."):
-        fig = go.Figure()
-        # Use a qualitative palette for clear differentiation
-        palette = px.colors.qualitative.Set2 + px.colors.qualitative.Set3
-        for i, ticker in enumerate(tickers):
+        # Fetch data for all tickers
+        ticker_data = {}
+        for ticker in tickers:
             hist = fetch_stock_history_robust(
                 ticker,
                 start=start_date,
@@ -718,8 +739,27 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
                 interval=interval
             )
             if hist is not None and not hist.empty:
+                ticker_data[ticker] = hist
+        
+        if not ticker_data:
+            st.error("No data available for the selected timeframe.")
+            return
+        
+        # Create tabs for different chart views
+        chart_tab1, chart_tab2 = st.tabs([
+            "Normalized Performance (%)", 
+            "Price Chart ($)"
+        ])
+        
+        # Use a qualitative palette for clear differentiation
+        palette = px.colors.qualitative.Set2 + px.colors.qualitative.Set3
+        
+        # Tab 1: Normalized Performance (current implementation)
+        with chart_tab1:
+            fig1 = go.Figure()
+            for i, (ticker, hist) in enumerate(ticker_data.items()):
                 normalized = (hist['Close'] / hist['Close'].iloc[0] - 1) * 100
-                fig.add_trace(go.Scatter(
+                fig1.add_trace(go.Scatter(
                     x=hist.index,
                     y=normalized,
                     mode='lines',
@@ -727,28 +767,81 @@ def create_portfolio_chart(tickers: List[str], timeframe: str):
                     line=dict(width=2, color=palette[i % len(palette)]),
                     hovertemplate=f'<b>{ticker}</b><br>Date: %{{x}}<br>Change: %{{y:.2f}}%<extra></extra>'
                 ))
-        fig.update_layout(
-            title=f"Portfolio Performance - {timeframe} (%)",
-            xaxis_title="Date",
-            yaxis_title="Change (%)",
-            height=500,
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            hovermode='x unified',
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1
+            
+            fig1.update_layout(
+                title=f"Portfolio Performance - {timeframe} (Normalized %)",
+                xaxis_title="Date",
+                yaxis_title="Change (%)",
+                height=500,
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                hovermode='x unified',
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1
+                )
             )
-        )
-        st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig1, use_container_width=True)
+        
+        # Tab 2: Individual Price Charts (Separate tabs for each ticker)
+        with chart_tab2:
+            # Create sub-tabs for each ticker
+            ticker_tabs = st.tabs(list(ticker_data.keys()))
+            
+            for ticker_tab, (ticker, hist) in zip(ticker_tabs, ticker_data.items()):
+                with ticker_tab:
+                    # Create individual price chart for this ticker
+                    fig_individual = go.Figure()
+                    
+                    # Find the color for this ticker (same as in normalized chart)
+                    ticker_index = list(ticker_data.keys()).index(ticker)
+                    ticker_color = palette[ticker_index % len(palette)]
+                    
+                    fig_individual.add_trace(go.Scatter(
+                        x=hist.index,
+                        y=hist['Close'],
+                        mode='lines',
+                        name=ticker,
+                        line=dict(width=2, color=ticker_color),
+                        hovertemplate=f'<b>{ticker}</b><br>Date: %{{x}}<br>Price: $%{{y:.2f}}<extra></extra>',
+                        showlegend=False  # No need for legend with single ticker
+                    ))
+                    
+                    # Get accurate current price using the same method as Historical Prices section
+                    current_data = fetch_stock_history_robust(ticker, period="1mo")
+                    if current_data is not None and not current_data.empty:
+                        actual_current_price = current_data['Close'].iloc[-1]
+                    else:
+                        actual_current_price = hist['Close'].iloc[-1]
+                    
+                    # Calculate stats using chart timeframe start and actual current price
+                    chart_start_price = hist['Close'].iloc[0]
+                    price_change = actual_current_price - chart_start_price
+                    pct_change = (price_change / chart_start_price) * 100
+                    
+                    # Create title with accurate price info
+                    title_text = f"{ticker} Stock Price - {timeframe}<br><sub>Start: ${chart_start_price:.2f} | Current: ${actual_current_price:.2f} | Change: ${price_change:+.2f} ({pct_change:+.2f}%)</sub>"
+                    
+                    fig_individual.update_layout(
+                        title=title_text,
+                        xaxis_title="Date",
+                        yaxis_title="Stock Price ($)",
+                        height=500,
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        hovermode='x'
+                    )
+                    
+                    st.plotly_chart(fig_individual, use_container_width=True)
 
     # Additional features section - only show this at the bottom
-    st.subheader("Additional Features")
+    st.markdown("---")
+    st.subheader("🔍 Additional Features")
     # Create tabs for additional features
-    tab1, tab2, tab3, tab4 = st.tabs(["Key Ticker Information", "Financials", "Monte Carlo Simulation", "Market Overview"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 Key Ticker Information", "📊 Financials", "🎲 Monte Carlo Simulation", "🌍 Market Overview"])
 
     with tab1:
         if st.session_state.get('portfolio_created', False):
@@ -1108,6 +1201,39 @@ def fetch_data_for_timeframe(ticker: str, mo_period: Optional[str], mo_interval:
     else:
         return fetch_stock_history_robust(ticker, period=mo_period, interval=mo_interval)
 
+def get_price_and_change_for_timeframe(ticker: str, mo_period: Optional[str], mo_interval: str, market_tf: str) -> Optional[tuple]:
+    """Get current price and percentage change with improved YTD handling."""
+    if market_tf == "YTD":
+        # Get current price from recent data (more reliable)
+        current_hist = fetch_stock_history_robust(ticker, period="5d", interval="1d")
+        if current_hist is None or current_hist.empty:
+            return None
+            
+        # Get YTD data from January 1st to now for accurate start price
+        current_year = datetime.today().year
+        start_date = datetime(current_year, 1, 1)
+        ytd_hist = fetch_stock_history_robust(ticker, start=start_date, end=datetime.today(), interval="1d")
+        
+        if ytd_hist is not None and not ytd_hist.empty and len(ytd_hist) > 0:
+            current_price = current_hist['Close'].iloc[-1]
+            # Use the actual first trading day of the year
+            start_price = ytd_hist['Close'].iloc[0]
+            change_pct = ((current_price - start_price) / start_price) * 100
+            return current_price, change_pct
+        else:
+            return None
+    else:
+        # For all other timeframes, use consistent data source
+        data = fetch_data_for_timeframe(ticker, mo_period, mo_interval, market_tf)
+        if data is not None and not data.empty and len(data) > 1:
+            # Ensure we have enough data points for meaningful comparison
+            current_price = data['Close'].iloc[-1]
+            start_price = data['Close'].iloc[0]
+            change_pct = ((current_price - start_price) / start_price) * 100
+            return current_price, change_pct
+        else:
+            return None
+
 def display_market_overview():
     st.markdown("## Market Overview")
 
@@ -1196,10 +1322,9 @@ def display_market_overview():
         </div>
         """, unsafe_allow_html=True)
         
-        spy_data = fetch_data_for_timeframe("SPY", mo_period, mo_interval, market_tf)
-        if spy_data is not None and not spy_data.empty:
-            spy_close = spy_data['Close'].iloc[-1]
-            spy_change = ((spy_close - spy_data['Close'].iloc[0]) / spy_data['Close'].iloc[0]) * 100
+        spy_result = get_price_and_change_for_timeframe("SPY", mo_period, mo_interval, market_tf)
+        if spy_result is not None:
+            spy_close, spy_change = spy_result
             
             spy_icon, spy_sentiment = get_spy_status_icon_and_label(spy_change, market_tf)
             change_color = "green" if spy_change > 0 else "red"
@@ -1231,10 +1356,9 @@ def display_market_overview():
         </div>
         """, unsafe_allow_html=True)
         
-        vix_data = fetch_data_for_timeframe("^VIX", mo_period, mo_interval, market_tf)
-        if vix_data is not None and not vix_data.empty:
-            vix_close = vix_data['Close'].iloc[-1]
-            vix_change = ((vix_close - vix_data['Close'].iloc[0]) / vix_data['Close'].iloc[0]) * 100
+        vix_result = get_price_and_change_for_timeframe("^VIX", mo_period, mo_interval, market_tf)
+        if vix_result is not None:
+            vix_close, vix_change = vix_result
             
             if vix_close < 15:
                 vix_indicator = "🟢"
@@ -1276,10 +1400,9 @@ def display_market_overview():
         </div>
         """, unsafe_allow_html=True)
         
-        treasury_data = fetch_data_for_timeframe("^TNX", mo_period, mo_interval, market_tf)
-        if treasury_data is not None and not treasury_data.empty:
-            yield_close = treasury_data['Close'].iloc[-1]
-            yield_change = ((yield_close - treasury_data['Close'].iloc[0]) / treasury_data['Close'].iloc[0]) * 100
+        treasury_result = get_price_and_change_for_timeframe("^TNX", mo_period, mo_interval, market_tf)
+        if treasury_result is not None:
+            yield_close, yield_change = treasury_result
             
             if yield_close < 3:
                 yield_indicator = "🟢"
@@ -1340,7 +1463,18 @@ def display_market_overview():
             tooltip = None if not is_forex else data[1]
             with cols[i]:
                 with st.spinner(f"Loading {name}..."):
-                    result = get_asset_price_change(ticker, period=mo_period)
+                    # Use the improved get_price_and_change_for_timeframe function
+                    price_result = get_price_and_change_for_timeframe(ticker, mo_period, mo_interval, market_tf)
+                    
+                    if price_result is not None:
+                        current_price, change_pct = price_result
+                        result = {
+                            'current_price': current_price,
+                            'pct_change': change_pct
+                        }
+                    else:
+                        result = None
+                    
                     if result:
                         price = f"${result['current_price']:,.2f}" if "Index" not in name else f"{result['current_price']:.2f}"
                         change = result['pct_change']
@@ -1378,9 +1512,22 @@ def display_market_overview():
     # Sector Performance
     st.markdown("### Sector Performance")
     with st.spinner("Loading sector performance..."):
-        sector_df = fetch_sector_performance()
+        sector_df = fetch_sector_performance(mo_period, mo_interval, market_tf)
         if sector_df is not None and not sector_df.empty:
-            st.dataframe(sector_df, use_container_width=True)
+            # Format the Change % column in the DataFrame with color coding
+            def color_change(val):
+                if val > 0:
+                    return f"color: green; font-weight: bold;"
+                elif val < 0:
+                    return f"color: red; font-weight: bold;"
+                return ""
+            
+            # Apply styling to the DataFrame
+            styled_df = sector_df.style.applymap(color_change, subset=['Change %'])
+            styled_df = styled_df.format({'Change %': '{:.2f}%'})
+            
+            # Display the styled DataFrame
+            st.dataframe(styled_df, use_container_width=True)
         else:
             st.warning("No sector data available.")
 
@@ -1418,7 +1565,7 @@ custom_palette = px.colors.sequential.Blues + px.colors.sequential.Purples
 
 def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarray] = None):
     """Display portfolio performance comparison with S&P 500 using selected date range"""
-    st.subheader("📈 Portfolio vs. S&P 500 Benchmark")
+    st.subheader("Portfolio vs. S&P 500 Benchmark")
     proxy = get_proxy_dict()  # Ensure proxy is defined
     start_date = st.session_state.get('start_date')
     end_date = st.session_state.get('end_date')
@@ -1469,7 +1616,7 @@ def display_benchmark_comparison(tickers: List[str], weights: Optional[np.ndarra
         portfolio_normalized = portfolio_value / portfolio_value.iloc[0] * 100
         spy_normalized = spy_hist['Close'] / spy_hist['Close'].iloc[0] * 100
         # Tabs for main chart and yearly breakdown
-        tab1, tab2 = st.tabs(["Performance Chart", "📊 Yearly Performance Breakdown"])
+        tab1, tab2 = st.tabs(["Performance Chart", "Yearly Performance Breakdown"])
         with tab1:
             # Create comparison chart
             fig = go.Figure()
@@ -2377,7 +2524,9 @@ def monte_carlo_simulation(start_value: float, mean_return: float, volatility: f
 # Main App Content
 def main():
     """Main application function"""
-    st.title("Optimal Portfolio Dashboard")
+    st.title("📈 Optimal Portfolio Dashboard")
+    st.markdown("*Optimize your investment portfolio with advanced analytics and real-time market data*")
+    st.markdown("---")
     
     # Check for missing dependencies
     missing_deps = []
@@ -2404,19 +2553,32 @@ def main():
             st.sidebar.success("Cache cleared!")
     
     # Portfolio input section
-    st.subheader("Portfolio Setup")
+    st.subheader("🎯 Portfolio Setup")
     
-    # Fetch S&P 500 tickers
+    # Fetch S&P 500 tickers with company names
     with st.spinner("Loading S&P 500 stocks..."):
-        sp500_tickers = fetch_sp500_tickers()
+        sp500_data = fetch_sp500_tickers_with_names()
+        sp500_tickers = list(sp500_data.keys())
+    
+    # Create display options (ticker - company name) and mapping
+    display_options = [f"{ticker} - {company}" for ticker, company in sp500_data.items()]
+    ticker_to_display = {ticker: f"{ticker} - {company}" for ticker, company in sp500_data.items()}
+    display_to_ticker = {f"{ticker} - {company}": ticker for ticker, company in sp500_data.items()}
+    
+    # Default selections (convert to display format)
+    default_tickers = ['AAPL', 'MSFT', 'TSLA'] if sp500_tickers and all(t in sp500_tickers for t in ['AAPL', 'MSFT', 'TSLA']) else (sp500_tickers[:3] if sp500_tickers else [])
+    default_display = [ticker_to_display.get(ticker, ticker) for ticker in default_tickers]
     
     # Stock selection interface - use full width
-    selected_from_dropdown = st.multiselect(
+    selected_display_options = st.multiselect(
         "Select stocks from S&P 500:",
-        options=sp500_tickers if sp500_tickers else [],
-        default=['AAPL', 'GOOGL', 'MSFT', 'TSLA'] if sp500_tickers and all(t in sp500_tickers for t in ['AAPL', 'GOOGL', 'MSFT', 'TSLA']) else (sp500_tickers[:4] if sp500_tickers else []),
+        options=display_options if display_options else [],
+        default=default_display,
         help="Select multiple stocks from the S&P 500"
     )
+    
+    # Convert selected display options back to ticker symbols
+    selected_from_dropdown = [display_to_ticker.get(option, option.split(' - ')[0]) for option in selected_display_options]
     
     # Combine selections and remove duplicates
     final_tickers = remove_duplicates(selected_from_dropdown)
@@ -2534,35 +2696,97 @@ def main():
     start_date = datetime(start_year, 1, 1)
     end_date = datetime(end_year, 12, 31)
 
-    # Store years in session state
-    st.session_state['start_year'] = start_year
-    st.session_state['end_year'] = end_year
-    st.session_state['start_date'] = start_date
-    st.session_state['end_date'] = end_date
+    # Store years in session state (only if changed to avoid unnecessary updates)
+    if st.session_state.get('start_year') != start_year:
+        st.session_state['start_year'] = start_year
+        st.session_state['start_date'] = start_date
+    if st.session_state.get('end_year') != end_year:
+        st.session_state['end_year'] = end_year
+        st.session_state['end_date'] = end_date
     
-    # Create portfolio button - centered
+    # Check if portfolio settings have changed
+    portfolio_exists = st.session_state.get('portfolio_created', False)
+    current_tickers = st.session_state.get('portfolio_tickers', [])
+    current_risk = st.session_state.get('portfolio_risk_level', 'Moderate')
+    current_start = st.session_state.get('portfolio_start_year', 2018)
+    current_end = st.session_state.get('portfolio_end_year', datetime.today().year)
+    current_custom_weights = st.session_state.get('portfolio_custom_weights', {})
+    
+    # Detect changes
+    tickers_changed = set(final_tickers) != set(current_tickers)
+    risk_changed = selected_risk_level != current_risk
+    years_changed = start_year != current_start or end_year != current_end
+    weights_changed = (selected_risk_level == "Custom" and 
+                      st.session_state.get('custom_weights', {}) != current_custom_weights)
+    
+    has_changes = tickers_changed or risk_changed or years_changed or weights_changed
+    
+    # Create/Update portfolio button - centered
     if final_tickers:
         col1, col2, col3 = st.columns([1, 1, 1])
         with col2:
-            if st.button("Create Optimal Portfolio", use_container_width=True):
+            # Dynamic button text and state
+            if portfolio_exists:
+                button_text = "Update Optimal Portfolio"
+                button_disabled = not has_changes
+                if has_changes:
+                    st.info("📝 Portfolio settings have changed. Click 'Update' to apply changes.")
+                else:
+                    st.success("✅ Portfolio is up to date")
+            else:
+                button_text = "Create Optimal Portfolio"
+                button_disabled = False
+            
+            if st.button(button_text, use_container_width=True, disabled=button_disabled):
+                # Store current settings as the active portfolio
                 st.session_state['portfolio_tickers'] = final_tickers
+                st.session_state['portfolio_risk_level'] = selected_risk_level
+                st.session_state['portfolio_start_year'] = start_year
+                st.session_state['portfolio_end_year'] = end_year
+                st.session_state['portfolio_custom_weights'] = st.session_state.get('custom_weights', {}).copy()
                 st.session_state['portfolio_created'] = True
-                st.success(f"Portfolio created with {len(final_tickers)} stocks!")
+                
+                if portfolio_exists:
+                    st.success(f"✅ Portfolio updated with {len(final_tickers)} stocks!")
+                else:
+                    st.success(f"🎉 Portfolio created with {len(final_tickers)} stocks!")
+                st.rerun()
     
     # Show portfolio analysis if created
     if st.session_state.get('portfolio_created', False):
+        # Use stored portfolio settings, not current form values
         tickers = st.session_state.get('portfolio_tickers', [])
+        portfolio_risk = st.session_state.get('portfolio_risk_level', 'Moderate')
+        portfolio_start_year = st.session_state.get('portfolio_start_year', 2018)
+        portfolio_end_year = st.session_state.get('portfolio_end_year', datetime.today().year)
+        portfolio_custom_weights = st.session_state.get('portfolio_custom_weights', {})
         
-        st.subheader("Portfolio Analysis")
+        # Temporarily override session state for portfolio analysis
+        original_risk = st.session_state.get('risk_level')
+        original_start_year = st.session_state.get('start_year')
+        original_end_year = st.session_state.get('end_year')
+        original_start_date = st.session_state.get('start_date')
+        original_end_date = st.session_state.get('end_date')
+        original_custom_weights = st.session_state.get('custom_weights')
         
-        # Display optimal portfolio with current risk level
+        # Set portfolio values for analysis
+        st.session_state['risk_level'] = portfolio_risk
+        st.session_state['start_year'] = portfolio_start_year
+        st.session_state['end_year'] = portfolio_end_year
+        st.session_state['start_date'] = datetime(portfolio_start_year, 1, 1)
+        st.session_state['end_date'] = datetime(portfolio_end_year, 12, 31)
+        st.session_state['custom_weights'] = portfolio_custom_weights
+        
+        st.subheader("📊 Portfolio Analysis")
+        
+        # Display optimal portfolio with stored settings
         display_optimal_portfolio(tickers)
         
         # Display benchmark comparison
         display_benchmark_comparison(tickers)
         
         # Chart section with timeframe selector
-        st.subheader("Portfolio Performance Chart")
+        st.subheader("📈 Portfolio Performance Chart")
         
         # Timeframe selector for chart only
         col1, col2, col3 = st.columns([1, 1, 1])
@@ -2577,6 +2801,14 @@ def main():
         
         # Create and display chart using selected timeframe
         create_portfolio_chart(tickers, chart_timeframe)
+        
+        # Restore original session state values
+        st.session_state['risk_level'] = original_risk
+        st.session_state['start_year'] = original_start_year
+        st.session_state['end_year'] = original_end_year
+        st.session_state['start_date'] = original_start_date
+        st.session_state['end_date'] = original_end_date
+        st.session_state['custom_weights'] = original_custom_weights
 
 
 
