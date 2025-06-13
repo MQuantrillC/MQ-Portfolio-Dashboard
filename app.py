@@ -836,6 +836,9 @@ def display_optimal_portfolio(tickers: List[str]):
                 validated_data = validate_stock_data(raw_info_dict.get(ticker), ticker)
                 enriched_data = enrich_stock_data(validated_data, ticker)
                 info_dict[ticker] = enriched_data
+                
+                # Debug analysis for each ticker if debug mode is on
+                debug_stock_data_comprehensive(ticker)
         
         returns_data = {}
         valid_tickers = []  # Track tickers with valid data
@@ -1921,6 +1924,9 @@ def display_ticker_info(ticker: str):
     validated_info = validate_stock_data(raw_info, ticker)
     info = enrich_stock_data(validated_info, ticker)
     
+    # Debug analysis if debug mode is on
+    debug_stock_data_comprehensive(ticker)
+    
     if not info or info.get('quoteType') is None:
         st.error(f"Could not fetch information for {ticker}")
         return
@@ -2922,7 +2928,14 @@ def main():
         st.stop()
     
     # Debug mode toggle
-    st.session_state['debug_mode'] = st.sidebar.checkbox("Debug Mode", value=st.session_state.get('debug_mode', False))
+    st.session_state['debug_mode'] = st.sidebar.checkbox("🔍 Debug Mode", value=st.session_state.get('debug_mode', False), 
+                                                        help="Enable detailed debugging for data fetching issues")
+    
+    # Clear cache button for debugging
+    if st.session_state.get('debug_mode', False):
+        if st.sidebar.button("🗑️ Clear Cache", help="Clear all cached data to force fresh fetches"):
+            st.cache_data.clear()
+            st.sidebar.success("Cache cleared!")
     
     # Portfolio input section
     st.subheader("Portfolio Setup")
@@ -3123,7 +3136,7 @@ def gradient_performance(val, positive_is_good=True):
 # Enhanced data fetching with unified approach
 @st.cache_data(ttl=1800, show_spinner=False)  # 30 minutes cache
 def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]:
-    """Robust stock info fetcher with multiple fallback strategies"""
+    """Robust stock info fetcher with multiple fallback strategies and comprehensive data validation"""
     if not YFINANCE_AVAILABLE:
         return None
     
@@ -3135,10 +3148,12 @@ def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]
             time.sleep(0.1 * (attempt + 1))  # Progressive delay
             
             info = ticker_obj.info
-            # More lenient check - accept if we have basic data
-            if info and isinstance(info, dict) and len(info) > 3:
+            # More comprehensive check - accept if we have meaningful data
+            if info and isinstance(info, dict) and len(info) > 5:
                 # Check if we have meaningful data (not just error responses)
-                if any(key in info for key in ['currentPrice', 'regularMarketPrice', 'shortName', 'longName']):
+                meaningful_fields = ['currentPrice', 'regularMarketPrice', 'shortName', 'longName', 
+                                   'marketCap', 'beta', 'sector', 'industry']
+                if any(key in info and info[key] not in [None, 0, ''] for key in meaningful_fields):
                     return info
                     
         except Exception as e:
@@ -3157,15 +3172,17 @@ def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]
                     time.sleep(0.3)
                     
                     info = ticker_obj.info
-                    if info and isinstance(info, dict) and len(info) > 3:
-                        if any(key in info for key in ['currentPrice', 'regularMarketPrice', 'shortName', 'longName']):
+                    if info and isinstance(info, dict) and len(info) > 5:
+                        meaningful_fields = ['currentPrice', 'regularMarketPrice', 'shortName', 'longName', 
+                                           'marketCap', 'beta', 'sector', 'industry']
+                        if any(key in info and info[key] not in [None, 0, ''] for key in meaningful_fields):
                             return info
             except Exception as e:
                 if st.session_state.get('debug_mode', False) and attempt == 1:
                     st.warning(f"Proxy attempt failed for {ticker}: {str(e)[:100]}")
                 time.sleep(1.0)
     
-    # Strategy 3: Try fast_info as last resort
+    # Strategy 3: Try fast_info as fallback
     try:
         yf.set_config(proxy=None)
         ticker_obj = yf.Ticker(ticker)
@@ -3173,7 +3190,7 @@ def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]
             fast_info = ticker_obj.fast_info
             if fast_info and hasattr(fast_info, 'last_price'):
                 # Convert fast_info to dict format with more fields
-                return {
+                fast_info_dict = {
                     'currentPrice': getattr(fast_info, 'last_price', None),
                     'regularMarketPrice': getattr(fast_info, 'last_price', None),
                     'marketCap': getattr(fast_info, 'market_cap', None),
@@ -3183,6 +3200,56 @@ def fetch_stock_info_robust(ticker: str, max_retries: int = 3) -> Optional[Dict]
                     'currency': getattr(fast_info, 'currency', 'USD'),
                     'exchange': getattr(fast_info, 'exchange', 'NASDAQ')
                 }
+                return fast_info_dict
+    except Exception:
+        pass
+    
+    # Strategy 4: Try to get basic info from recent history
+    try:
+        yf.set_config(proxy=None)
+        ticker_obj = yf.Ticker(ticker)
+        recent_hist = ticker_obj.history(period="5d", timeout=15)
+        if recent_hist is not None and not recent_hist.empty:
+            current_price = recent_hist['Close'].iloc[-1]
+            # Create basic info dict from historical data
+            basic_info = {
+                'currentPrice': current_price,
+                'regularMarketPrice': current_price,
+                'shortName': ticker,
+                'longName': ticker,
+                'quoteType': 'EQUITY',
+                'currency': 'USD'
+            }
+            
+            # Try to add volume and other basic metrics
+            if 'Volume' in recent_hist.columns:
+                basic_info['volume'] = recent_hist['Volume'].iloc[-1]
+            if len(recent_hist) > 1:
+                prev_close = recent_hist['Close'].iloc[-2]
+                basic_info['previousClose'] = prev_close
+                basic_info['regularMarketChangePercent'] = ((current_price - prev_close) / prev_close) * 100
+            
+            return basic_info
+    except Exception:
+        pass
+    
+    # Strategy 5: Last resort - try alternative data extraction
+    try:
+        yf.set_config(proxy=None)
+        ticker_obj = yf.Ticker(ticker)
+        
+        # Try different yfinance attributes
+        for attr_name in ['info', 'fast_info', 'get_info']:
+            try:
+                if hasattr(ticker_obj, attr_name):
+                    attr_data = getattr(ticker_obj, attr_name)
+                    if callable(attr_data):
+                        attr_data = attr_data()
+                    
+                    if attr_data and isinstance(attr_data, dict) and len(attr_data) > 2:
+                        return attr_data
+            except:
+                continue
     except Exception:
         pass
     
@@ -3325,32 +3392,83 @@ def validate_stock_data(data: Optional[Dict], ticker: str) -> Dict:
     
     # Handle price fields - try multiple possible keys
     if not validated_data.get('currentPrice'):
-        for price_key in ['regularMarketPrice', 'previousClose', 'open']:
-            if validated_data.get(price_key):
+        for price_key in ['regularMarketPrice', 'previousClose', 'open', 'regularMarketOpen', 'dayHigh', 'dayLow']:
+            if validated_data.get(price_key) and validated_data[price_key] not in [None, 0]:
                 validated_data['currentPrice'] = validated_data[price_key]
                 break
     
     # Handle name fields - try multiple possible keys
     if not validated_data.get('shortName'):
-        for name_key in ['longName', 'displayName']:
+        for name_key in ['longName', 'displayName', 'symbol']:
             if validated_data.get(name_key):
                 validated_data['shortName'] = validated_data[name_key]
                 break
         if not validated_data.get('shortName'):
             validated_data['shortName'] = ticker
     
-    # Handle beta - try different keys
+    # Enhanced beta handling - try ALL possible beta field names
     if not validated_data.get('beta'):
-        for beta_key in ['beta3Year', 'beta5Year']:
-            if validated_data.get(beta_key):
-                validated_data['beta'] = validated_data[beta_key]
+        beta_keys = [
+            'beta', 'betaThreeYear', 'betaFiveYear', 'beta3Year', 'beta5Year', 
+            'threeYearAverageReturn', 'fiveYearAverageReturn', 'regularMarketBeta'
+        ]
+        for beta_key in beta_keys:
+            beta_val = validated_data.get(beta_key)
+            if beta_val is not None and beta_val != 0 and not pd.isna(beta_val):
+                validated_data['beta'] = beta_val
                 break
     
-    # Handle PE ratio - try different keys
+    # Enhanced PE ratio handling - try different keys
     if not validated_data.get('trailingPE'):
-        for pe_key in ['forwardPE', 'priceToEarningsTrailing12Months']:
-            if validated_data.get(pe_key):
-                validated_data['trailingPE'] = validated_data[pe_key]
+        pe_keys = ['forwardPE', 'priceToEarningsTrailing12Months', 'trailingPE', 'pe']
+        for pe_key in pe_keys:
+            pe_val = validated_data.get(pe_key)
+            if pe_val is not None and pe_val > 0 and not pd.isna(pe_val):
+                validated_data['trailingPE'] = pe_val
+                break
+    
+    # Enhanced market cap handling
+    if not validated_data.get('marketCap'):
+        for mc_key in ['marketCap', 'sharesOutstanding']:
+            mc_val = validated_data.get(mc_key)
+            if mc_val is not None and mc_val > 0:
+                if mc_key == 'sharesOutstanding' and validated_data.get('currentPrice'):
+                    validated_data['marketCap'] = mc_val * validated_data['currentPrice']
+                else:
+                    validated_data['marketCap'] = mc_val
+                break
+    
+    # Enhanced sector/industry handling
+    if not validated_data.get('sector'):
+        for sector_key in ['sector', 'sectorKey', 'sectorDisp']:
+            if validated_data.get(sector_key):
+                validated_data['sector'] = validated_data[sector_key]
+                break
+    
+    if not validated_data.get('industry'):
+        for industry_key in ['industry', 'industryKey', 'industryDisp']:
+            if validated_data.get(industry_key):
+                validated_data['industry'] = validated_data[industry_key]
+                break
+    
+    # Enhanced 52-week range handling
+    if not validated_data.get('fiftyTwoWeekHigh'):
+        for high_key in ['fiftyTwoWeekHigh', '52WeekHigh', 'yearHigh']:
+            if validated_data.get(high_key):
+                validated_data['fiftyTwoWeekHigh'] = validated_data[high_key]
+                break
+    
+    if not validated_data.get('fiftyTwoWeekLow'):
+        for low_key in ['fiftyTwoWeekLow', '52WeekLow', 'yearLow']:
+            if validated_data.get(low_key):
+                validated_data['fiftyTwoWeekLow'] = validated_data[low_key]
+                break
+    
+    # Enhanced company info handling
+    if not validated_data.get('fullTimeEmployees'):
+        for emp_key in ['fullTimeEmployees', 'employees', 'totalEmployees']:
+            if validated_data.get(emp_key):
+                validated_data['fullTimeEmployees'] = validated_data[emp_key]
                 break
     
     # Set minimal defaults only for truly missing critical fields
@@ -3432,59 +3550,257 @@ def fetch_financial_statement_robust(
     return None
 
 def enrich_stock_data(data: Dict, ticker: str) -> Dict:
-    """Try to enrich stock data with additional information from various yfinance attributes"""
+    """Aggressively enrich stock data with additional information from various yfinance attributes and strategies"""
     if not YFINANCE_AVAILABLE:
         return data
     
-    # Only try enrichment if we're missing critical data
-    missing_critical = not all([
-        data.get('sector'), 
-        data.get('industry'), 
-        data.get('currentPrice'),
-        data.get('beta')
-    ])
+    # Always try enrichment for critical missing fields - be more aggressive
+    critical_fields = ['sector', 'industry', 'currentPrice', 'beta', 'marketCap', 'trailingPE', 
+                      'fiftyTwoWeekHigh', 'fiftyTwoWeekLow', 'fullTimeEmployees']
     
-    if not missing_critical:
+    missing_critical = any(not data.get(field) for field in critical_fields)
+    
+    # Also enrich if we have very basic data (likely from fallback)
+    has_minimal_data = len([k for k, v in data.items() if v not in [None, 'N/A', ticker]]) < 5
+    
+    if not missing_critical and not has_minimal_data:
         return data
     
-    try:
-        yf.set_config(proxy=None)
-        ticker_obj = yf.Ticker(ticker)
-        time.sleep(0.1)  # Small delay
-        
-        # Try to get additional info from different yfinance attributes
+    enriched_data = data.copy()
+    
+    # Strategy 1: Multiple info attempts with different configurations
+    for attempt in range(3):
         try:
-            # Sometimes info fails but other attributes work
+            if attempt == 0:
+                yf.set_config(proxy=None)  # No proxy first
+            elif attempt == 1 and PROXY_AVAILABLE:
+                proxy = get_proxy_dict(probability=1.0)
+                if proxy:
+                    yf.set_config(proxy=proxy)
+                else:
+                    continue
+            else:
+                continue
+                
+            ticker_obj = yf.Ticker(ticker)
+            time.sleep(0.1 * (attempt + 1))
+            
+            # Try to get comprehensive info
             if hasattr(ticker_obj, 'info'):
                 additional_info = ticker_obj.info
-                if additional_info and isinstance(additional_info, dict) and len(additional_info) > 3:
-                    # Only update if we got meaningful data
-                    fields_to_update = [
-                        'sector', 'industry', 'beta', 'trailingPE', 'marketCap',
-                        'fullTimeEmployees', 'city', 'state', 'companyOfficers',
-                        'fiftyTwoWeekHigh', 'fiftyTwoWeekLow'
-                    ]
+                if additional_info and isinstance(additional_info, dict) and len(additional_info) > 5:
+                    # Comprehensive field mapping for enrichment
+                    field_mappings = {
+                        'beta': ['beta', 'betaThreeYear', 'betaFiveYear', 'beta3Year', 'beta5Year'],
+                        'trailingPE': ['trailingPE', 'forwardPE', 'priceToEarningsTrailing12Months'],
+                        'marketCap': ['marketCap', 'enterpriseValue'],
+                        'sector': ['sector', 'sectorKey', 'sectorDisp'],
+                        'industry': ['industry', 'industryKey', 'industryDisp'],
+                        'currentPrice': ['currentPrice', 'regularMarketPrice', 'previousClose'],
+                        'fiftyTwoWeekHigh': ['fiftyTwoWeekHigh', '52WeekHigh'],
+                        'fiftyTwoWeekLow': ['fiftyTwoWeekLow', '52WeekLow'],
+                        'fullTimeEmployees': ['fullTimeEmployees', 'employees'],
+                        'companyOfficers': ['companyOfficers'],
+                        'city': ['city', 'headquarters'],
+                        'state': ['state', 'country'],
+                        'longName': ['longName', 'shortName'],
+                        'shortName': ['shortName', 'longName']
+                    }
                     
-                    for field in fields_to_update:
-                        if not data.get(field) and additional_info.get(field):
-                            data[field] = additional_info[field]
+                    for target_field, source_fields in field_mappings.items():
+                        if not enriched_data.get(target_field):
+                            for source_field in source_fields:
+                                source_val = additional_info.get(source_field)
+                                if source_val is not None and source_val not in [0, '', 'N/A']:
+                                    # Additional validation for numeric fields
+                                    if target_field in ['beta', 'trailingPE', 'marketCap', 'currentPrice']:
+                                        if isinstance(source_val, (int, float)) and source_val > 0:
+                                            enriched_data[target_field] = source_val
+                                            break
+                                    else:
+                                        enriched_data[target_field] = source_val
+                                        break
+                    
+                    # If we got good data, break out of attempts
+                    if len([k for k, v in enriched_data.items() if v not in [None, 'N/A', ticker]]) > len([k for k, v in data.items() if v not in [None, 'N/A', ticker]]):
+                        break
+                        
+        except Exception as e:
+            if st.session_state.get('debug_mode', False):
+                st.warning(f"Enrichment attempt {attempt+1} failed for {ticker}: {str(e)[:100]}")
+            time.sleep(0.5)
+            continue
+    
+    # Strategy 2: Try to get current price from recent history if still missing
+    if not enriched_data.get('currentPrice'):
+        try:
+            yf.set_config(proxy=None)
+            ticker_obj = yf.Ticker(ticker)
+            recent_hist = ticker_obj.history(period="5d", timeout=10)
+            if recent_hist is not None and not recent_hist.empty:
+                enriched_data['currentPrice'] = recent_hist['Close'].iloc[-1]
+                # Also try to get 52-week range from longer history
+                if not enriched_data.get('fiftyTwoWeekHigh') or not enriched_data.get('fiftyTwoWeekLow'):
+                    year_hist = ticker_obj.history(period="1y", timeout=15)
+                    if year_hist is not None and not year_hist.empty:
+                        if not enriched_data.get('fiftyTwoWeekHigh'):
+                            enriched_data['fiftyTwoWeekHigh'] = year_hist['High'].max()
+                        if not enriched_data.get('fiftyTwoWeekLow'):
+                            enriched_data['fiftyTwoWeekLow'] = year_hist['Low'].min()
         except Exception:
             pass
-        
-        # Try to get current price from recent history if missing
-        if not data.get('currentPrice'):
-            try:
-                recent_hist = ticker_obj.history(period="1d", timeout=10)
-                if recent_hist is not None and not recent_hist.empty:
-                    data['currentPrice'] = recent_hist['Close'].iloc[-1]
-            except Exception:
-                pass
-                
-    except Exception:
-        if st.session_state.get('debug_mode', False):
-            st.warning(f"Enrichment failed for {ticker}")
     
-    return data
+    # Strategy 3: Try fast_info as additional source
+    if not enriched_data.get('currentPrice') or not enriched_data.get('marketCap'):
+        try:
+            yf.set_config(proxy=None)
+            ticker_obj = yf.Ticker(ticker)
+            if hasattr(ticker_obj, 'fast_info'):
+                fast_info = ticker_obj.fast_info
+                if fast_info:
+                    if not enriched_data.get('currentPrice') and hasattr(fast_info, 'last_price'):
+                        enriched_data['currentPrice'] = fast_info.last_price
+                    if not enriched_data.get('marketCap') and hasattr(fast_info, 'market_cap'):
+                        enriched_data['marketCap'] = fast_info.market_cap
+        except Exception:
+            pass
+    
+    # Strategy 4: Calculate missing market cap if we have shares outstanding and price
+    if not enriched_data.get('marketCap') and enriched_data.get('currentPrice'):
+        try:
+            yf.set_config(proxy=None)
+            ticker_obj = yf.Ticker(ticker)
+            info = ticker_obj.info
+            if info and info.get('sharesOutstanding'):
+                enriched_data['marketCap'] = info['sharesOutstanding'] * enriched_data['currentPrice']
+        except Exception:
+            pass
+    
+    # Strategy 5: For beta, try to calculate from historical data if still missing
+    if not enriched_data.get('beta'):
+        try:
+            yf.set_config(proxy=None)
+            # Get 2 years of data for both stock and market (SPY)
+            stock_hist = yf.Ticker(ticker).history(period="2y", timeout=20)
+            spy_hist = yf.Ticker("SPY").history(period="2y", timeout=20)
+            
+            if (stock_hist is not None and not stock_hist.empty and 
+                spy_hist is not None and not spy_hist.empty and 
+                len(stock_hist) > 50 and len(spy_hist) > 50):
+                
+                # Calculate daily returns
+                stock_returns = stock_hist['Close'].pct_change().dropna()
+                spy_returns = spy_hist['Close'].pct_change().dropna()
+                
+                # Align the data
+                common_dates = stock_returns.index.intersection(spy_returns.index)
+                if len(common_dates) > 50:
+                    stock_aligned = stock_returns.loc[common_dates]
+                    spy_aligned = spy_returns.loc[common_dates]
+                    
+                    # Calculate beta using covariance method
+                    covariance = stock_aligned.cov(spy_aligned)
+                    spy_variance = spy_aligned.var()
+                    
+                    if spy_variance > 0:
+                        calculated_beta = covariance / spy_variance
+                        if 0.1 <= calculated_beta <= 3.0:  # Reasonable beta range
+                            enriched_data['beta'] = round(calculated_beta, 2)
+        except Exception:
+            pass
+    
+    if st.session_state.get('debug_mode', False):
+        original_fields = len([k for k, v in data.items() if v not in [None, 'N/A', ticker]])
+        enriched_fields = len([k for k, v in enriched_data.items() if v not in [None, 'N/A', ticker]])
+        if enriched_fields > original_fields:
+            st.success(f"✓ Enriched {ticker}: {original_fields} → {enriched_fields} fields")
+    
+    return enriched_data
+
+def debug_stock_data_comprehensive(ticker: str) -> None:
+    """Comprehensive debugging function to analyze what data is available for a ticker"""
+    if not st.session_state.get('debug_mode', False):
+        return
+    
+    st.markdown(f"### 🔍 Debug Analysis for {ticker}")
+    
+    # Test 1: Raw fetch
+    with st.expander(f"Raw Fetch Results for {ticker}"):
+        raw_info = fetch_stock_info_robust(ticker)
+        if raw_info:
+            st.success(f"✅ Raw fetch successful - {len(raw_info)} fields")
+            
+            # Show key fields we care about
+            key_fields = ['beta', 'trailingPE', 'marketCap', 'currentPrice', 'sector', 'industry', 
+                         'shortName', 'longName', 'fiftyTwoWeekHigh', 'fiftyTwoWeekLow']
+            
+            found_fields = {}
+            missing_fields = []
+            
+            for field in key_fields:
+                if field in raw_info and raw_info[field] not in [None, 0, '', 'N/A']:
+                    found_fields[field] = raw_info[field]
+                else:
+                    missing_fields.append(field)
+            
+            if found_fields:
+                st.write("**Found Key Fields:**")
+                for field, value in found_fields.items():
+                    st.write(f"- {field}: {value}")
+            
+            if missing_fields:
+                st.write("**Missing Key Fields:**")
+                st.write(f"- {', '.join(missing_fields)}")
+            
+            # Show all beta-related fields
+            beta_fields = [k for k in raw_info.keys() if 'beta' in k.lower()]
+            if beta_fields:
+                st.write("**All Beta-related Fields:**")
+                for field in beta_fields:
+                    st.write(f"- {field}: {raw_info[field]}")
+            
+            # Show all PE-related fields
+            pe_fields = [k for k in raw_info.keys() if any(pe_term in k.lower() for pe_term in ['pe', 'price', 'earning'])]
+            if pe_fields:
+                st.write("**All PE/Price-related Fields:**")
+                for field in pe_fields[:10]:  # Limit to first 10
+                    st.write(f"- {field}: {raw_info[field]}")
+        else:
+            st.error("❌ Raw fetch failed")
+    
+    # Test 2: After validation
+    with st.expander(f"After Validation for {ticker}"):
+        validated_info = validate_stock_data(raw_info, ticker)
+        if validated_info:
+            st.success(f"✅ Validation successful - {len(validated_info)} fields")
+            
+            key_fields = ['beta', 'trailingPE', 'marketCap', 'currentPrice', 'sector', 'industry']
+            for field in key_fields:
+                value = validated_info.get(field, 'N/A')
+                status = "✅" if value not in [None, 'N/A', 0, ''] else "❌"
+                st.write(f"{status} {field}: {value}")
+        else:
+            st.error("❌ Validation failed")
+    
+    # Test 3: After enrichment
+    with st.expander(f"After Enrichment for {ticker}"):
+        enriched_info = enrich_stock_data(validated_info, ticker)
+        if enriched_info:
+            st.success(f"✅ Enrichment completed - {len(enriched_info)} fields")
+            
+            key_fields = ['beta', 'trailingPE', 'marketCap', 'currentPrice', 'sector', 'industry']
+            for field in key_fields:
+                value = enriched_info.get(field, 'N/A')
+                status = "✅" if value not in [None, 'N/A', 0, ''] else "❌"
+                st.write(f"{status} {field}: {value}")
+                
+            # Show improvement from validation to enrichment
+            original_count = len([k for k, v in validated_info.items() if v not in [None, 'N/A', ticker, 0, '']])
+            enriched_count = len([k for k, v in enriched_info.items() if v not in [None, 'N/A', ticker, 0, '']])
+            if enriched_count > original_count:
+                st.info(f"📈 Enrichment added {enriched_count - original_count} fields")
+        else:
+            st.error("❌ Enrichment failed")
 
 if __name__ == "__main__":
     main()
