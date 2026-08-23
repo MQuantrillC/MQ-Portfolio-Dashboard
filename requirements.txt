@@ -1,10 +1,8 @@
-streamlit
-numpy
-pandas
-yfinance
-plotly
-matplotlib
-scipy
-requests
-beautifulsoup4
-free_proxy
+streamlit>=1.44,<2
+pandas>=2.2,<3
+numpy>=2.0,<3
+scipy>=1.15,<2
+plotly>=6.0,<7
+yfinance>=0.2.61
+requests>=2.32,<3
+lxml>=5.0            # required by pandas.read_html for the S&P 500 scrape
