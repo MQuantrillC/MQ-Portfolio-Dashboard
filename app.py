@@ -22,20 +22,12 @@ from views.portfolio import (
     render_ticker_detail,
 )
 from views.setup import render_setup, render_sidebar
-from views.styles import apply_page_style
+from views.styles import apply_page_style, render_footer
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-
-DISCLAIMER = (
-    "**Educational project — not investment advice.** Every figure is derived "
-    "from historical Yahoo Finance data, which may be delayed by 15–20 minutes. "
-    "Optimised allocations are fitted to the past and past performance does not "
-    "predict future returns."
-)
-
 
 def _lazy_section(key: str, label: str, render, *args) -> None:
     """Render a section only once the user asks for it.
@@ -68,8 +60,17 @@ def main() -> None:
         "Mean-variance portfolio optimisation, benchmarking and fundamental "
         "analysis across the S&P 500."
     )
-    st.info(DISCLAIMER, icon="ℹ️")
 
+    _render_dashboard()
+    render_footer()
+
+
+def _render_dashboard() -> None:
+    """The dashboard body.
+
+    Separate from ``main`` so its early returns skip the rest of the analysis
+    without also skipping the footer.
+    """
     risk_free_rate, max_weight = render_sidebar()
     config = render_setup(risk_free_rate, max_weight)
     if config is None:
